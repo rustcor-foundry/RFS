@@ -138,7 +138,15 @@ operations, acks immediately, folds into the next regular txg.
 - Reclaimed once the folding txg commits (head pointer advances).
 - Gets its own crash-injection fuzzing, like the superblock ring already has.
 
-## Snapshot directory + space reclamation (planned, M3/M4)
+## Snapshot directory (implemented) + space reclamation (partial)
+
+The directory is a single self-checksummed block at `snaplist_root` (magic
+`b"RSNP"`, u32 count, then 64-byte entries `{id, txg, root.addr, root.birth,
+root.checksum[32]}`, Fletcher-64 trailer). Written copy-on-write; the old block
+becomes unreferenced and is reclaimed at the next mount. Mount-time mark-and-sweep
+walks the directory block **and every snapshot's tree**, so snapshot-pinned blocks
+are never reclaimed or reused. Snapshot *deletion* and precise dead-list freeing
+are the remaining piece.
 
 - Snapshot = preserved root tagged with its `txg`, recorded under `snaplist_root`.
 - Free path: `block.birth_txg > youngest_snapshot.txg` → free now; else append to
