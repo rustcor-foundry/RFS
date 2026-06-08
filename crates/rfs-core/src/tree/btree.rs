@@ -17,9 +17,11 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use super::node::{Internal, Leaf, Node, max_internal_keys, max_leaf_entries, read_node, write_node};
+use super::node::{
+    Internal, Leaf, Node, leaf_fits, leaf_split_index, max_internal_keys, read_node, write_node,
+};
 use super::ptr::BlockPtr;
-use super::{Key, Record};
+use super::{Key, Value};
 use crate::allocator::Allocator;
 use crate::buffer::BufferPool;
 use crate::device::BlockDevice;
@@ -57,7 +59,7 @@ pub struct Tree<K, V> {
     marker: PhantomData<(K, V)>,
 }
 
-impl<K: Key, V: Record> Tree<K, V> {
+impl<K: Key, V: Value> Tree<K, V> {
     /// An empty tree.
     #[must_use]
     pub const fn empty() -> Self {
@@ -97,7 +99,7 @@ impl<K: Key, V: Record> Tree<K, V> {
                         .entries
                         .binary_search_by(|(k, _)| k.cmp(key))
                         .ok()
-                        .map(|i| leaf.entries[i].1));
+                        .map(|i| leaf.entries[i].1.clone()));
                 }
                 Node::Internal(node) => {
                     let idx = node.keys.partition_point(|sep| *sep <= *key);
@@ -186,10 +188,12 @@ impl<K: Key, V: Record> Tree<K, V> {
         }
         leaf.generation = txg;
 
-        // 3. Write the leaf, splitting if it overflows.
-        let max_leaf = max_leaf_entries::<K, V>(block_size);
-        let (mut child_ptr, mut split) = if leaf.entries.len() > max_leaf {
-            let mid = leaf.entries.len() / 2;
+        // 3. Write the leaf, splitting (by bytes) if it no longer fits a block.
+        let (mut child_ptr, mut split) = if leaf_fits::<K, V>(&leaf.entries, block_size) {
+            let ptr = put(&Node::Leaf(leaf), txn).await?;
+            (ptr, None)
+        } else {
+            let mid = leaf_split_index::<K, V>(&leaf.entries);
             let right_entries = leaf.entries.split_off(mid);
             let separator = right_entries[0].0;
             let right = Node::Leaf(Leaf {
@@ -200,9 +204,6 @@ impl<K: Key, V: Record> Tree<K, V> {
             let lptr = put(&left, txn).await?;
             let rptr = put(&right, txn).await?;
             (lptr, Some((separator, rptr)))
-        } else {
-            let ptr = put(&Node::Leaf(leaf), txn).await?;
-            (ptr, None)
         };
         // The old leaf block is now superseded; free it unless a snapshot pins it.
         if leaf_old.birth_txg > keep {
@@ -328,7 +329,7 @@ impl<K: Key, V: Record> Tree<K, V> {
 
 /// Writes a node through the transaction: copy-on-write (new block, never
 /// overwrite), stamped with the txn's `txg`.
-async fn put<K: Key, V: Record, A: Allocator, D: BlockDevice>(
+async fn put<K: Key, V: Value, A: Allocator, D: BlockDevice>(
     node: &Node<K, V>,
     txn: &mut Txn<'_, A, D>,
 ) -> Result<BlockPtr, StorageError> {

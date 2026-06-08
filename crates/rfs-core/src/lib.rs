@@ -50,5 +50,5 @@ pub use digest::{Digest, Fast64, Hasher, SimdLevel};
 pub use error::{CorruptKind, StorageError};
 pub use snapshot::SnapEntry;
 pub use superblock::Superblock;
-pub use tree::{BlockPtr, Internal, Key, Leaf, Node, Record, Tree, Txn};
+pub use tree::{BlockPtr, Internal, Key, Leaf, Node, Record, Tree, Txn, Value};
 pub use volume::Volume;
