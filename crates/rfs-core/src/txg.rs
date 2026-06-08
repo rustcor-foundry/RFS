@@ -24,8 +24,8 @@ use crate::device::BlockDevice;
 use crate::digest::Hasher;
 use crate::error::StorageError;
 use crate::tree::{
-    BlockPtr, Internal, Key, Leaf, Node, Record, max_internal_keys, max_leaf_entries, read_node,
-    write_node,
+    BlockPtr, Internal, Key, Leaf, Node, Value, leaf_fits, leaf_split_index, max_internal_keys,
+    read_node, write_node,
 };
 
 use core::future::Future;
@@ -62,7 +62,7 @@ pub struct Txg<K, V> {
     freed: Vec<BlockPtr>,
 }
 
-impl<K: Key, V: Record> Txg<K, V> {
+impl<K: Key, V: Value> Txg<K, V> {
     /// Opens a transaction over an existing on-disk root (or none).
     #[must_use]
     pub fn begin(root: Option<BlockPtr>) -> Self {
@@ -118,8 +118,8 @@ impl<K: Key, V: Record> Txg<K, V> {
         pool: &mut BufferPool,
         hasher: Hasher,
     ) -> Result<(), StorageError> {
-        let max_leaf = max_leaf_entries::<K, V>(dev.block_size());
-        let max_int = max_internal_keys::<K>(dev.block_size(), hasher.output_len());
+        let block_size = dev.block_size();
+        let max_int = max_internal_keys::<K>(block_size, hasher.output_len());
 
         let mut root = self.root.take();
         match root {
@@ -128,7 +128,7 @@ impl<K: Key, V: Record> Txg<K, V> {
             }
             Some(mut slot) => {
                 let split = insert_rec(
-                    &mut slot, key, val, dev, pool, hasher, max_leaf, max_int, &mut self.freed,
+                    &mut slot, key, val, dev, pool, hasher, block_size, max_int, &mut self.freed,
                 )
                 .await?;
                 root = Some(match split {
@@ -191,11 +191,11 @@ impl<K: Key, V: Record> Txg<K, V> {
     }
 }
 
-fn search<K: Key, V: Record>(entries: &[(K, V)], key: &K) -> Option<V> {
+fn search<K: Key, V: Value>(entries: &[(K, V)], key: &K) -> Option<V> {
     entries
         .binary_search_by(|(k, _)| k.cmp(key))
         .ok()
-        .map(|i| entries[i].1)
+        .map(|i| entries[i].1.clone())
 }
 
 fn child_index<K: Key>(keys: &[K], key: &K) -> usize {
@@ -214,7 +214,7 @@ fn level_of<K, V>(slot: &Slot<K, V>) -> u8 {
 }
 
 /// Converts a `Disk` slot into a dirtied `Mem` node, recording the old block.
-fn fault_in<'f, K: Key, V: Record, D: BlockDevice>(
+fn fault_in<'f, K: Key, V: Value, D: BlockDevice>(
     slot: &'f mut Slot<K, V>,
     dev: &'f D,
     pool: &'f mut BufferPool,
@@ -243,14 +243,14 @@ fn fault_in<'f, K: Key, V: Record, D: BlockDevice>(
 /// Recursive `CoW` insert over the shadow. Returns `Some((separator, right))` if
 /// this node split.
 #[allow(clippy::too_many_arguments)]
-fn insert_rec<'f, K: Key, V: Record, D: BlockDevice>(
+fn insert_rec<'f, K: Key, V: Value, D: BlockDevice>(
     slot: &'f mut Slot<K, V>,
     key: K,
     val: V,
     dev: &'f D,
     pool: &'f mut BufferPool,
     hasher: Hasher,
-    max_leaf: usize,
+    block_size: usize,
     max_int: usize,
     freed: &'f mut Vec<BlockPtr>,
 ) -> Fut<'f, Option<(K, Slot<K, V>)>> {
@@ -266,8 +266,8 @@ fn insert_rec<'f, K: Key, V: Record, D: BlockDevice>(
                     Ok(i) => entries[i].1 = val,
                     Err(i) => entries.insert(i, (key, val)),
                 }
-                if entries.len() > max_leaf {
-                    let mid = entries.len() / 2;
+                if !leaf_fits::<K, V>(entries, block_size) {
+                    let mid = leaf_split_index::<K, V>(entries);
                     let right = entries.split_off(mid);
                     let sep = right[0].0;
                     return Ok(Some((sep, Slot::Mem(Box::new(DNode::Leaf(right))))));
@@ -283,7 +283,7 @@ fn insert_rec<'f, K: Key, V: Record, D: BlockDevice>(
                     dev,
                     &mut *pool,
                     hasher,
-                    max_leaf,
+                    block_size,
                     max_int,
                     &mut *freed,
                 )
@@ -312,7 +312,7 @@ fn insert_rec<'f, K: Key, V: Record, D: BlockDevice>(
 }
 
 /// Recursive `CoW` delete over the shadow (no rebalance).
-fn delete_rec<'f, K: Key, V: Record, D: BlockDevice>(
+fn delete_rec<'f, K: Key, V: Value, D: BlockDevice>(
     slot: &'f mut Slot<K, V>,
     key: &'f K,
     dev: &'f D,
@@ -343,7 +343,7 @@ fn delete_rec<'f, K: Key, V: Record, D: BlockDevice>(
 }
 
 /// Recursively serializes a slot, writing dirty nodes children-first.
-fn serialize_rec<'f, K: Key + 'f, V: Record + 'f, A: Allocator, D: BlockDevice>(
+fn serialize_rec<'f, K: Key + 'f, V: Value + 'f, A: Allocator, D: BlockDevice>(
     slot: Slot<K, V>,
     txg: u64,
     alloc: &'f mut A,

@@ -25,7 +25,7 @@ use crate::checksum::fletcher64;
 use crate::device::BlockDevice;
 use crate::error::StorageError;
 use crate::superblock::RING;
-use crate::tree::{Key, Record};
+use crate::tree::{Key, Record, Value};
 
 /// First ZIL block (immediately after the superblock ring).
 pub const ZIL_START: u64 = RING;
@@ -44,8 +44,9 @@ const HEADER_LEN: usize = 24;
 const TAG_INSERT: u8 = 0;
 const TAG_DELETE: u8 = 1;
 
-/// A logged operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A logged operation. Records are variable-length on disk (the value is
+/// length-prefixed), matching the tree's variable values.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ZilRecord<K, V> {
     /// Insert/update `key => val`.
     Insert(K, V),
@@ -53,27 +54,27 @@ pub enum ZilRecord<K, V> {
     Delete(K),
 }
 
-const fn slot_len<K: Record, V: Record>() -> usize {
-    1 + K::SIZE + V::SIZE
-}
-
-/// Records that fit in one ZIL block.
-#[must_use]
-pub fn max_records<K: Record, V: Record>(block_size: usize) -> usize {
-    (block_size - HEADER_LEN - 8) / slot_len::<K, V>()
+/// On-disk length of one record: `tag(1) + key + vlen(2) + value`.
+fn record_len<K: Record, V: Value>(rec: &ZilRecord<K, V>) -> usize {
+    let vlen = match rec {
+        ZilRecord::Insert(_, v) => v.encoded_len(),
+        ZilRecord::Delete(_) => 0,
+    };
+    1 + K::SIZE + 2 + vlen
 }
 
 const fn block_addr(seq: u64) -> u64 {
     ZIL_START + seq % ZIL_CAPACITY
 }
 
-fn encode<K: Key, V: Record>(
+fn encode<K: Key, V: Value>(
     records: &[ZilRecord<K, V>],
     txg: u64,
     seq: u64,
     buf: &mut [u8],
 ) -> Result<(), StorageError> {
-    if records.len() > max_records::<K, V>(buf.len()) {
+    let used: usize = HEADER_LEN + records.iter().map(record_len::<K, V>).sum::<usize>() + 8;
+    if used > buf.len() {
         return Err(StorageError::BufferSize);
     }
     buf.fill(0);
@@ -83,20 +84,20 @@ fn encode<K: Key, V: Record>(
     buf[OFF_TXG..OFF_TXG + 8].copy_from_slice(&txg.to_le_bytes());
     buf[OFF_SEQ..OFF_SEQ + 8].copy_from_slice(&seq.to_le_bytes());
 
-    let stride = slot_len::<K, V>();
-    for (i, rec) in records.iter().enumerate() {
-        let o = HEADER_LEN + i * stride;
-        match rec {
-            ZilRecord::Insert(k, v) => {
-                buf[o] = TAG_INSERT;
-                k.write(&mut buf[o + 1..o + 1 + K::SIZE]);
-                v.write(&mut buf[o + 1 + K::SIZE..o + stride]);
-            }
-            ZilRecord::Delete(k) => {
-                buf[o] = TAG_DELETE;
-                k.write(&mut buf[o + 1..o + 1 + K::SIZE]);
-            }
+    let mut o = HEADER_LEN;
+    for rec in records {
+        let (tag, key, vlen) = match rec {
+            ZilRecord::Insert(k, v) => (TAG_INSERT, k, v.encoded_len()),
+            ZilRecord::Delete(k) => (TAG_DELETE, k, 0),
+        };
+        buf[o] = tag;
+        key.write(&mut buf[o + 1..o + 1 + K::SIZE]);
+        let vlen16 = u16::try_from(vlen).map_err(|_| StorageError::BufferSize)?;
+        buf[o + 1 + K::SIZE..o + 3 + K::SIZE].copy_from_slice(&vlen16.to_le_bytes());
+        if let ZilRecord::Insert(_, v) = rec {
+            v.encode(&mut buf[o + 3 + K::SIZE..o + 3 + K::SIZE + vlen]);
         }
+        o += 3 + K::SIZE + vlen;
     }
 
     let len = buf.len();
@@ -106,8 +107,8 @@ fn encode<K: Key, V: Record>(
 }
 
 /// Returns the records of a valid block, or `None` for end-of-log (bad magic,
-/// torn checksum, stale `txg`, or wrong `seq`).
-fn decode<K: Key, V: Record>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Option<Vec<ZilRecord<K, V>>> {
+/// torn checksum, stale `txg`, wrong `seq`, or a malformed/overrunning record).
+fn decode<K: Key, V: Value>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Option<Vec<ZilRecord<K, V>>> {
     if u32::from_le_bytes(buf[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap()) != MAGIC {
         return None;
     }
@@ -123,20 +124,29 @@ fn decode<K: Key, V: Record>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Op
         return None;
     }
     let count = usize::from(u16::from_le_bytes(buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap()));
-    if count > max_records::<K, V>(len) {
-        return None;
-    }
 
-    let stride = slot_len::<K, V>();
+    let payload_end = len - 8;
+    let mut o = HEADER_LEN;
     let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let o = HEADER_LEN + i * stride;
+    for _ in 0..count {
+        if o + 3 + K::SIZE > payload_end {
+            return None;
+        }
+        let tag = buf[o];
         let key = K::read(&buf[o + 1..o + 1 + K::SIZE]);
-        match buf[o] {
-            TAG_INSERT => out.push(ZilRecord::Insert(key, V::read(&buf[o + 1 + K::SIZE..o + stride]))),
+        let vlen = usize::from(u16::from_le_bytes(
+            buf[o + 1 + K::SIZE..o + 3 + K::SIZE].try_into().unwrap(),
+        ));
+        let vstart = o + 3 + K::SIZE;
+        if vstart + vlen > payload_end {
+            return None;
+        }
+        match tag {
+            TAG_INSERT => out.push(ZilRecord::Insert(key, V::decode(&buf[vstart..vstart + vlen]))),
             TAG_DELETE => out.push(ZilRecord::Delete(key)),
             _ => return None,
         }
+        o = vstart + vlen;
     }
     Some(out)
 }
@@ -145,7 +155,7 @@ fn decode<K: Key, V: Record>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Op
 ///
 /// # Errors
 /// Device or capacity errors.
-pub async fn append<K: Key, V: Record, D: BlockDevice>(
+pub async fn append<K: Key, V: Value, D: BlockDevice>(
     records: &[ZilRecord<K, V>],
     txg: u64,
     seq: u64,
@@ -167,7 +177,7 @@ pub async fn append<K: Key, V: Record, D: BlockDevice>(
 ///
 /// # Errors
 /// Device read errors.
-pub async fn read<K: Key, V: Record, D: BlockDevice>(
+pub async fn read<K: Key, V: Value, D: BlockDevice>(
     seq: u64,
     expect_txg: u64,
     dev: &D,

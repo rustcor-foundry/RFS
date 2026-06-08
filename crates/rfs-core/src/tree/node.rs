@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 
 use super::ptr::{BlockPtr, MAX_CKSUM};
-use super::{Key, Record};
+use super::{Key, Record, Value};
 use crate::allocator::{Allocator, SegKind};
 use crate::buffer::BufferPool;
 use crate::device::BlockDevice;
@@ -29,10 +29,40 @@ const OFF_COUNT: usize = 6;
 const OFF_GENERATION: usize = 8;
 const HEADER_LEN: usize = 16;
 
-/// Maximum `(key, value)` entries that fit in a leaf for this block size.
+/// Bytes a leaf occupies on disk: the header plus, per entry, the fixed key, a
+/// 2-byte length, and the variable value. Values are length-prefixed, so leaves
+/// hold variable-size items (Btrfs "fixed key, variable data" model).
 #[must_use]
-pub fn max_leaf_entries<K: Record, V: Record>(block_size: usize) -> usize {
-    (block_size - HEADER_LEN) / (K::SIZE + V::SIZE)
+pub fn leaf_used_bytes<K: Record, V: Value>(entries: &[(K, V)]) -> usize {
+    HEADER_LEN
+        + entries
+            .iter()
+            .map(|(_, v)| K::SIZE + 2 + v.encoded_len())
+            .sum::<usize>()
+}
+
+/// Whether `entries` fit in a single leaf block.
+#[must_use]
+pub fn leaf_fits<K: Record, V: Value>(entries: &[(K, V)], block_size: usize) -> bool {
+    leaf_used_bytes::<K, V>(entries) <= block_size
+}
+
+/// Byte-balanced split point (start index of the right half) for an overfull
+/// leaf. Returns `1..entries.len()` when there are ≥ 2 entries.
+#[must_use]
+pub fn leaf_split_index<K: Record, V: Value>(entries: &[(K, V)]) -> usize {
+    let total: usize = entries
+        .iter()
+        .map(|(_, v)| K::SIZE + 2 + v.encoded_len())
+        .sum();
+    let mut acc = 0usize;
+    for (i, (_, v)) in entries.iter().enumerate() {
+        acc += K::SIZE + 2 + v.encoded_len();
+        if acc * 2 >= total && i + 1 < entries.len() {
+            return i + 1;
+        }
+    }
+    entries.len() / 2
 }
 
 /// Maximum separator keys that fit in an internal node (it also holds `n + 1`
@@ -74,7 +104,7 @@ pub enum Node<K, V> {
     Internal(Internal<K>),
 }
 
-impl<K: Key, V: Record> Node<K, V> {
+impl<K: Key, V: Value> Node<K, V> {
     /// Tree level (0 for a leaf).
     #[must_use]
     pub fn level(&self) -> u8 {
@@ -96,8 +126,7 @@ impl<K: Key, V: Record> Node<K, V> {
 
         match self {
             Self::Leaf(leaf) => {
-                let stride = K::SIZE + V::SIZE;
-                if leaf.entries.len() > max_leaf_entries::<K, V>(buf.len()) {
+                if !leaf_fits::<K, V>(&leaf.entries, buf.len()) {
                     return Err(StorageError::BufferSize);
                 }
                 let count = u16::try_from(leaf.entries.len())
@@ -106,10 +135,18 @@ impl<K: Key, V: Record> Node<K, V> {
                 buf[OFF_COUNT..OFF_COUNT + 2].copy_from_slice(&count.to_le_bytes());
                 buf[OFF_GENERATION..OFF_GENERATION + 8]
                     .copy_from_slice(&leaf.generation.to_le_bytes());
-                for (i, (k, v)) in leaf.entries.iter().enumerate() {
-                    let off = HEADER_LEN + i * stride;
-                    k.write(&mut buf[off..off + K::SIZE]);
-                    v.write(&mut buf[off + K::SIZE..off + stride]);
+                // Fixed key + 2-byte length per item in a header array, then the
+                // variable value bytes packed in order after the headers.
+                let mut hdr = HEADER_LEN;
+                let mut data = HEADER_LEN + leaf.entries.len() * (K::SIZE + 2);
+                for (k, v) in &leaf.entries {
+                    let vlen = v.encoded_len();
+                    let vlen16 = u16::try_from(vlen).map_err(|_| StorageError::BufferSize)?;
+                    k.write(&mut buf[hdr..hdr + K::SIZE]);
+                    buf[hdr + K::SIZE..hdr + K::SIZE + 2].copy_from_slice(&vlen16.to_le_bytes());
+                    v.encode(&mut buf[data..data + vlen]);
+                    hdr += K::SIZE + 2;
+                    data += vlen;
                 }
             }
             Self::Internal(node) => {
@@ -168,16 +205,27 @@ impl<K: Key, V: Record> Node<K, V> {
             u64::from_le_bytes(buf[OFF_GENERATION..OFF_GENERATION + 8].try_into().unwrap());
 
         if level == 0 {
-            if count > max_leaf_entries::<K, V>(buf.len()) {
-                return Err(StorageError::Corrupt(CorruptKind::BadNode));
+            // Bounds-check the header array, then read each length-prefixed value.
+            let bad = StorageError::Corrupt(CorruptKind::BadNode);
+            let headers_end = HEADER_LEN + count * (K::SIZE + 2);
+            if headers_end > buf.len() {
+                return Err(bad);
             }
-            let stride = K::SIZE + V::SIZE;
             let mut entries = Vec::with_capacity(count);
-            for i in 0..count {
-                let off = HEADER_LEN + i * stride;
-                let k = K::read(&buf[off..off + K::SIZE]);
-                let v = V::read(&buf[off + K::SIZE..off + stride]);
-                entries.push((k, v));
+            let mut hdr = HEADER_LEN;
+            let mut data = headers_end;
+            for _ in 0..count {
+                let k = K::read(&buf[hdr..hdr + K::SIZE]);
+                let vlen = usize::from(u16::from_le_bytes(
+                    buf[hdr + K::SIZE..hdr + K::SIZE + 2].try_into().unwrap(),
+                ));
+                let end = data.checked_add(vlen).ok_or(bad)?;
+                if end > buf.len() {
+                    return Err(bad);
+                }
+                entries.push((k, V::decode(&buf[data..end])));
+                hdr += K::SIZE + 2;
+                data = end;
             }
             Ok(Self::Leaf(Leaf {
                 generation,
@@ -228,7 +276,7 @@ pub async fn write_node<K, V, A, D>(
 ) -> Result<BlockPtr, StorageError>
 where
     K: Key,
-    V: Record,
+    V: Value,
     A: Allocator,
     D: BlockDevice,
 {
@@ -258,7 +306,7 @@ fn encode_and_address<K, V, A>(
 ) -> Result<BlockPtr, StorageError>
 where
     K: Key,
-    V: Record,
+    V: Value,
     A: Allocator,
 {
     node.encode(buf, hasher.output_len())?;
@@ -290,7 +338,7 @@ pub async fn read_node<K, V, D>(
 ) -> Result<Node<K, V>, StorageError>
 where
     K: Key,
-    V: Record,
+    V: Value,
     D: BlockDevice,
 {
     let mut buf = pool.acquire();
@@ -307,7 +355,7 @@ async fn read_verify_decode<K, V, D>(
 ) -> Result<Node<K, V>, StorageError>
 where
     K: Key,
-    V: Record,
+    V: Value,
     D: BlockDevice,
 {
     dev.read_block(ptr.addr, buf.as_mut_slice()).await?;
@@ -322,7 +370,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Internal, Leaf, Node, max_internal_keys, max_leaf_entries, read_node, write_node};
+    use super::{Internal, Leaf, Node, leaf_fits, max_internal_keys, read_node, write_node};
     use crate::allocator::{SegmentAllocator, SegmentGeom};
     use crate::buffer::BufferPool;
     use crate::checksum::DigestMode;
@@ -374,8 +422,11 @@ mod tests {
 
     #[test]
     fn capacities_are_sane() {
-        // 4096 - 16 header = 4080; leaf stride 16 -> 255.
-        assert_eq!(max_leaf_entries::<u64, u64>(BS), 255);
+        // Leaf is byte-based now: header(16) + N*(key 8 + len 2 + value 8) <= 4096.
+        let full: alloc::vec::Vec<(u64, u64)> = (0..200u64).map(|k| (k, k)).collect();
+        assert!(leaf_fits::<u64, u64>(&full, BS));
+        let toobig: alloc::vec::Vec<(u64, u64)> = (0..300u64).map(|k| (k, k)).collect();
+        assert!(!leaf_fits::<u64, u64>(&toobig, BS));
         // internal: ptr 24, (4096-16-24)/(8+24) = 4056/32 = 126.
         assert_eq!(max_internal_keys::<u64>(BS, 8), 126);
     }

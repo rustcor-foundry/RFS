@@ -35,6 +35,11 @@ and the **ZIL** — `sync_insert`/`sync_delete` make writes durable immediately 
 a reserved intent-log ring, replayed on mount. fsync'd writes survive a crash;
 un-synced ones may not; a full ring forces a commit.
 
+M7 (started): the tree now stores **variable-length values** (`Value` trait;
+fixed keys, variable item data) — the foundation for inodes/dirents/extents of
+differing sizes. The VFS itself (FsKey schema, path resolution, file/dir ops) is
+Phase 2.
+
 M6 (started): a **byte-driven, model-checked crash-recovery driver**
 (`testkit::fuzz_crash_recovery`) shared by a deterministic in-crate simulation
 (48 seeds × random insert/delete/fsync/commit/power-cut/torn-commit steps, each
@@ -128,7 +133,12 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     deterministic simulation test, and a `cargo fuzz` target (`fuzz/`).
   - [ ] Run the libFuzzer campaign on Linux.
   - [ ] FUSE mount (after M7 — it exposes the POSIX VFS).
-- [ ] **M7 — VFS / POSIX inode layer** (inodes, directories, paths over the KV tree).
+- [~] **M7 — VFS / POSIX inode layer** (inodes, directories, paths over the KV tree):
+  - [x] Phase 1: variable-length leaf values (`Value` trait; Btrfs "fixed key,
+    variable item data"). Leaves pack length-prefixed values and split by bytes;
+    keys + internal nodes stay fixed. Tree/txg/ZIL all converted.
+  - [ ] Phase 2: FsKey `(object_id, kind, k2)` + typed values (inode / dirent /
+    extent), path resolution, file read/write, directory ops; FS API on `Volume`.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine

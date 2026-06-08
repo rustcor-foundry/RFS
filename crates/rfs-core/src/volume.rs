@@ -31,7 +31,7 @@ use crate::digest::Hasher;
 use crate::error::StorageError;
 use crate::snapshot::{self, SnapEntry};
 use crate::superblock::{self, Superblock};
-use crate::tree::{BlockPtr, Key, Record, Tree};
+use crate::tree::{BlockPtr, Key, Tree, Value};
 use crate::txg::Txg;
 use crate::zil::{self, ZIL_CAPACITY, ZilRecord};
 
@@ -54,7 +54,7 @@ pub struct Volume<K, V, A, D> {
     zil_seq: u64,
 }
 
-impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
+impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// Formats a fresh volume on `dev` and returns it mounted and empty.
     ///
     /// # Errors
@@ -208,7 +208,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         if self.zil_seq >= ZIL_CAPACITY {
             self.commit().await?; // ring full: drain it into a real txg (resets seq)
         }
-        self.txg.insert(key, val, &self.dev, &mut self.pool, self.hasher).await?;
+        self.txg.insert(key, val.clone(), &self.dev, &mut self.pool, self.hasher).await?;
         zil::append(
             &[ZilRecord::Insert(key, val)],
             self.sb.txg,
