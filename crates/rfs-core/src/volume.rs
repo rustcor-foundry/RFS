@@ -189,6 +189,26 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.txg.get(key, &self.dev, &mut self.pool, self.hasher).await
     }
 
+    /// Collects `[start, end)` from the **committed** tree into `out`, ascending.
+    /// (Callers that need their own uncommitted writes reflected should commit
+    /// first; the higher FS layer commits per operation.)
+    ///
+    /// # Errors
+    /// Device or verification errors.
+    pub async fn range(
+        &mut self,
+        start: K,
+        end: K,
+        out: &mut Vec<(K, V)>,
+    ) -> Result<(), StorageError> {
+        if let Some(root) = self.committed_root() {
+            Tree::<K, V>::at(root)
+                .range(start, end, &self.dev, &mut self.pool, self.hasher, out)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Removes `key` from the open transaction (not durable until
     /// [`commit`](Self::commit)). Returns whether it was present.
     ///

@@ -43,6 +43,12 @@ pub enum StorageError {
     NoSpace,
     /// A referenced object (e.g. a snapshot id) does not exist.
     NotFound,
+    /// An object that must not already exist does (e.g. a duplicate name).
+    AlreadyExists,
+    /// An operation required a directory (or a non-directory) and got the other.
+    NotADirectory,
+    /// A directory operation requires the directory to be empty.
+    NotEmpty,
     /// Stored state failed structural validation.
     Corrupt(CorruptKind),
 }
