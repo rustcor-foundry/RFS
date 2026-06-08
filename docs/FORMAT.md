@@ -151,8 +151,12 @@ are the remaining piece.
 - Snapshot = preserved root tagged with its `txg`, recorded under `snaplist_root`.
 - Free path: `block.birth_txg > youngest_snapshot.txg` → free now; else append to
   that snapshot's dead-list (deferred).
-- Snapshot delete: merge dead-list against the next-older snapshot; free what is
-  now unreferenced.
+- Free path (implemented): on CoW overwrite, a replaced block is freed now iff
+  `birth_txg > youngest_snapshot.txg`; otherwise it is pinned by a snapshot and
+  retained. `delete_snapshot` removes the entry, commits, then reclaims the
+  snapshot's unique blocks via an online mark-and-sweep.
+- Snapshot delete (future, incremental): merge a per-snapshot dead-list against
+  the next-older snapshot instead of a full sweep.
 - Even with no snapshots, CoW requires deferred frees within a txg: a block freed
   in txg N is reusable only after the root referencing its replacement commits.
   The allocator stays dumb (`free` = mark free); the transaction layer owns the

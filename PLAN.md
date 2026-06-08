@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**38 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**39 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -23,9 +23,14 @@ captures a root into a self-checksummed snapshot directory; `get_in_snapshot`
 reads pinned state; mark-and-sweep walks every snapshot tree so pinned blocks
 survive remount.
 
-In progress: M3 — snapshot *deletion* + birth-time/dead-list reclamation
-(free blocks held only by a deleted snapshot); proactive in-session freeing on
-CoW overwrite; persisted space map to avoid the full-tree scan on mount.
+Also done: **proactive free on CoW overwrite** (a replaced block is freed unless
+its `birth_txg` shows a snapshot pins it) and **`Volume::delete_snapshot`** with
+reclamation (removes the entry, commits, then an online mark-and-sweep frees the
+blocks the snapshot alone pinned).
+
+In progress: M3 — per-snapshot dead-lists to make delete/free incremental (vs.
+the current full sweep); persisted space map to avoid the full-tree scan on
+mount. Then M4 (txg + ZIL).
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -88,8 +93,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] Snapshots: `Volume::snapshot`/`get_in_snapshot`, self-checksummed
     snapshot directory, mark-and-sweep walks snapshot trees (pinned blocks
     survive remount).
-  - [ ] Snapshot delete + birth-time/dead-list reclamation; proactive free on
-    CoW overwrite.
+  - [x] Proactive free on CoW overwrite (birth-time gated) + `delete_snapshot`
+    with online mark-and-sweep reclamation.
+  - [ ] Per-snapshot dead-lists (incremental delete/free vs. full sweep).
   - [ ] Persisted space map (avoid full-tree scan on mount).
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
   nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
