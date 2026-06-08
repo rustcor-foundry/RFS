@@ -124,19 +124,25 @@ payload is read, so a corrupt header cannot cause an OOB read.
 Capacities (4 KiB block, u64/u64, Fast64): **255** leaf entries, **126** internal
 keys. Tree operations (CoW insert/split/lookup) are the next M3 increment.
 
-## Intent log / ZIL (planned, M4)
+## Intent log / ZIL (implemented, M4)
 
-Self-checksummed append log for synchronous (`fsync`) writes. Records logical
-operations, acks immediately, folds into the next regular txg.
+Low-latency durability for synchronous (`fsync`) writes; consistency still comes
+from the superblock ring. Implemented as a **fixed ring of `ZIL_CAPACITY` blocks
+in the reserved region** (right after the superblock ring at `ZIL_START = RING`),
+so the allocator never touches it — no chain pointers, no marking, no leaks.
 
-- Record header `{ checksum, seq, txg, op_type, len }` + payload.
-- Chain anchored at superblock `zil_head`; the run ends at the first record whose
-  checksum fails (torn tail) — the same torn-write tolerance as the superblock
-  ring.
-- Mount order: recover superblock → replay ZIL records newer than the committed
-  root → fold into the open txg.
-- Reclaimed once the folding txg commits (head pointer advances).
-- Gets its own crash-injection fuzzing, like the superblock ring already has.
+- Block: magic `b"RZIL"`, count, `txg`, `seq`, fixed-slot records
+  `{tag, key, [val]}`, Fletcher-64 trailer. Record `seq` lives at
+  `ZIL_START + seq % ZIL_CAPACITY`.
+- `sync_insert`/`sync_delete` apply to the open txg **and** append a record block
+  (+flush) tagged with the committed `(txg, seq)`.
+- Mount: replay `seq = 0,1,…` while each block validates (magic, checksum, current
+  `txg`, expected `seq`); a torn tail / stale `txg` / gap ends replay. Replayed
+  ops re-apply to the open txg and fold into the next commit.
+- Each commit re-bases the log (`seq` → 0; older-`txg` blocks ignored). A full
+  ring forces a commit to drain it.
+- Result: fsync'd writes survive a crash; un-synced writes may not (POSIX-correct).
+- Gets its own crash-injection fuzzing alongside the superblock ring (M6).
 
 ## Snapshot directory (implemented) + space reclamation (partial)
 

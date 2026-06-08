@@ -34,6 +34,7 @@ pub mod superblock;
 pub mod tree;
 pub mod txg;
 pub mod volume;
+pub mod zil;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
