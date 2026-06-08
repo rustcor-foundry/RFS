@@ -40,6 +40,10 @@ pub struct Txn<'a, A, D> {
     pub pool: &'a mut BufferPool,
     /// Selected digest.
     pub hasher: Hasher,
+    /// Birth-time watermark for reclamation: a replaced block is freed only if
+    /// its `birth_txg` is strictly greater than this (i.e. it was born after the
+    /// most recent snapshot, so no snapshot pins it). `0` ⇒ free everything.
+    pub keep_through_txg: u64,
 }
 
 /// A copy-on-write B+-tree rooted at an optional [`BlockPtr`].
@@ -158,16 +162,19 @@ impl<K: Key, V: Record> Tree<K, V> {
             return Ok(());
         };
 
-        // 1. Descend to the target leaf, recording the internal-node path.
-        let mut path: Vec<(Internal<K>, usize)> = Vec::new();
+        // 1. Descend to the target leaf, recording the path and each visited
+        //    node's *old* pointer (so its block can be freed once replaced).
+        let keep = txn.keep_through_txg;
+        let mut path: Vec<(Internal<K>, usize, BlockPtr)> = Vec::new();
         let mut current = root_ptr;
-        let mut leaf = loop {
-            match read_node::<K, V, D>(&current, dev, &mut *txn.pool, hasher).await? {
-                Node::Leaf(l) => break l,
+        let (mut leaf, leaf_old) = loop {
+            let here = current;
+            match read_node::<K, V, D>(&here, dev, &mut *txn.pool, hasher).await? {
+                Node::Leaf(l) => break (l, here),
                 Node::Internal(node) => {
                     let idx = node.keys.partition_point(|sep| *sep <= key);
                     current = node.children[idx];
-                    path.push((node, idx));
+                    path.push((node, idx, here));
                 }
             }
         };
@@ -197,11 +204,15 @@ impl<K: Key, V: Record> Tree<K, V> {
             let ptr = put(&Node::Leaf(leaf), txn).await?;
             (ptr, None)
         };
+        // The old leaf block is now superseded; free it unless a snapshot pins it.
+        if leaf_old.birth_txg > keep {
+            txn.alloc.free(leaf_old.addr)?;
+        }
 
         // 4. Rebuild ancestors bottom-up, propagating splits.
         let max_int = max_internal_keys::<K>(block_size, hasher.output_len());
         let mut child_level: u8 = 0;
-        while let Some((mut parent, idx)) = path.pop() {
+        while let Some((mut parent, idx, parent_old)) = path.pop() {
             let plevel = parent.level;
             parent.children[idx] = child_ptr;
             if let Some((separator, rptr)) = split.take() {
@@ -228,6 +239,9 @@ impl<K: Key, V: Record> Tree<K, V> {
                 split = Some((promote, rptr));
             } else {
                 child_ptr = put(&Node::<K, V>::Internal(parent), txn).await?;
+            }
+            if parent_old.birth_txg > keep {
+                txn.alloc.free(parent_old.addr)?;
             }
             child_level = plevel;
         }
@@ -301,6 +315,7 @@ mod tests {
             dev: &e.dev,
             pool: &mut e.pool,
             hasher: e.hasher,
+            keep_through_txg: 0,
         }
     }
 

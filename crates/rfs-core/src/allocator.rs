@@ -105,6 +105,12 @@ pub trait Allocator {
     /// (immutable until it empties); the rest become free and reusable.
     /// Unreferenced (garbage) blocks in fully-dead segments are reclaimed.
     fn finish_rebuild(&mut self);
+
+    /// Clears all accounting back to "everything free" (except the reserved
+    /// prefix) so an in-place mark-and-sweep (`reset` → `mark_live`* →
+    /// `finish_rebuild`) can recompute free space — e.g. after deleting a
+    /// snapshot.
+    fn reset(&mut self);
 }
 
 /// Static description of how the device is divided into segments.
@@ -375,6 +381,22 @@ impl Allocator for SegmentAllocator {
             }
         }
         self.free_segments = free;
+    }
+
+    fn reset(&mut self) {
+        for seg in &mut self.segments {
+            if seg.state != SegState::Reserved {
+                seg.state = SegState::Free;
+                seg.write_ptr = 0;
+                seg.valid = 0;
+            }
+        }
+        for word in &mut self.bitmap.words {
+            *word = 0;
+        }
+        self.active = [None; SegKind::COUNT];
+        self.free_segments = self.geom.segment_count - self.geom.reserved_segments;
+        self.dirty.clear();
     }
 }
 

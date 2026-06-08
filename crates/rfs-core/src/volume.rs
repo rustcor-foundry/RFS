@@ -143,6 +143,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     pub async fn insert(&mut self, key: K, val: V) -> Result<(), StorageError> {
         // Tree is Copy (just a root pointer), so operate on a local copy and
         // store it back — sidesteps borrowing several fields of `self` at once.
+        let keep_through_txg = self.youngest_snap_txg();
         let mut tree = self.tree;
         let mut txn = Txn {
             txg: self.sb.txg + 1,
@@ -150,6 +151,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             dev: &self.dev,
             pool: &mut self.pool,
             hasher: self.hasher,
+            keep_through_txg,
         };
         tree.insert(key, val, &mut txn).await?;
         self.tree = tree;
@@ -176,15 +178,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     pub async fn commit(&mut self) -> Result<(), StorageError> {
         let mut sb = self.sb;
         sb.txg += 1;
-        if let Some(ptr) = self.tree.root {
-            sb.root_addr = ptr.addr;
-            sb.root_birth_txg = ptr.birth_txg;
-            sb.root_checksum = ptr.checksum;
-        } else {
-            sb.root_addr = 0;
-            sb.root_birth_txg = 0;
-            sb.root_checksum = [0u8; 32];
-        }
+        stamp_root(&mut sb, self.tree.root);
 
         // The durability barrier. Only on success do we adopt the new superblock
         // and let the allocator reuse blocks the old root no longer needs.
@@ -215,17 +209,93 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         let mut sb = self.sb;
         sb.txg = next;
         sb.snaplist_root = snaplist_root;
-        if let Some(ptr) = self.tree.root {
-            sb.root_addr = ptr.addr;
-            sb.root_birth_txg = ptr.birth_txg;
-            sb.root_checksum = ptr.checksum;
-        }
+        stamp_root(&mut sb, self.tree.root);
 
         superblock::commit(&self.dev, &sb).await?;
         self.sb = sb;
         self.snaps = snaps;
         self.alloc.commit();
         Ok(id)
+    }
+
+    /// Youngest (most recent) snapshot's txg, or 0 if there are none. Blocks born
+    /// at or before this are pinned by a snapshot and not freed on overwrite.
+    #[must_use]
+    fn youngest_snap_txg(&self) -> u64 {
+        self.snaps.iter().map(|s| s.txg).max().unwrap_or(0)
+    }
+
+    /// Deletes snapshot `id` and reclaims the blocks it alone pinned.
+    ///
+    /// Removes the entry, commits, then runs an in-place mark-and-sweep so blocks
+    /// no longer reachable from the live tree or any remaining snapshot become
+    /// free. (Reclamation is currently a full sweep; per-snapshot dead-lists to
+    /// make it incremental are a later optimization.)
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] for an unknown id, or device errors.
+    pub async fn delete_snapshot(&mut self, id: u64) -> Result<(), StorageError> {
+        let pos = self
+            .snaps
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(StorageError::NotFound)?;
+        let mut snaps = self.snaps.clone();
+        snaps.remove(pos);
+
+        let mut sb = self.sb;
+        sb.txg += 1;
+        sb.snaplist_root = if snaps.is_empty() {
+            0
+        } else {
+            snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?
+        };
+        stamp_root(&mut sb, self.tree.root);
+
+        superblock::commit(&self.dev, &sb).await?;
+        self.sb = sb;
+        self.snaps = snaps;
+        self.alloc.commit();
+
+        self.gc().await
+    }
+
+    /// In-place mark-and-sweep: rebuild allocator free space from everything
+    /// currently reachable (live tree + snapshot directory + snapshot trees),
+    /// freeing all unreachable blocks. Same computation `open` does, run online.
+    async fn gc(&mut self) -> Result<(), StorageError> {
+        let mut live = Vec::new();
+        self.tree
+            .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut live)
+            .await?;
+        if self.sb.snaplist_root != 0 {
+            live.push(self.sb.snaplist_root);
+            for snap in &self.snaps {
+                if !snap.root.is_null() {
+                    Tree::<K, V>::at(snap.root)
+                        .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut live)
+                        .await?;
+                }
+            }
+        }
+        self.alloc.reset();
+        for block in live {
+            self.alloc.mark_live(block)?;
+        }
+        self.alloc.finish_rebuild();
+        Ok(())
+    }
+
+    /// Enumerates every block referenced by the current (live) tree.
+    ///
+    /// # Errors
+    /// Device or verification errors.
+    pub async fn live_blocks(&mut self) -> Result<Vec<u64>, StorageError> {
+        let mut out = Vec::new();
+        self.tree
+            .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut out)
+            .await?;
+        Ok(out)
     }
 
     /// The recorded snapshots, oldest first.
@@ -275,6 +345,19 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
                 .await?;
         }
         Ok(out)
+    }
+}
+
+/// Stamps a tree root (or the null root, when empty) into a superblock.
+fn stamp_root(sb: &mut Superblock, root: Option<BlockPtr>) {
+    if let Some(ptr) = root {
+        sb.root_addr = ptr.addr;
+        sb.root_birth_txg = ptr.birth_txg;
+        sb.root_checksum = ptr.checksum;
+    } else {
+        sb.root_addr = 0;
+        sb.root_birth_txg = 0;
+        sb.root_checksum = [0u8; 32];
     }
 }
 
@@ -418,6 +501,50 @@ mod tests {
             assert_eq!(block_on(vol2.get(&k)).unwrap(), Some(k + 1000));
         }
         assert_eq!(vol2.snapshots().len(), 1);
+    }
+
+    #[test]
+    fn delete_snapshot_reclaims_only_its_unique_blocks() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k)).unwrap();
+        }
+        let s0 = block_on(vol.snapshot()).unwrap();
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k + 1000)).unwrap();
+        }
+        block_on(vol.commit()).unwrap();
+
+        // Blocks held by the snapshot but no longer by the live tree.
+        let snap_blocks = block_on(vol.snapshot_blocks(s0)).unwrap();
+        let live_blocks = block_on(vol.live_blocks()).unwrap();
+        let unique: alloc::vec::Vec<u64> = snap_blocks
+            .iter()
+            .copied()
+            .filter(|b| !live_blocks.contains(b))
+            .collect();
+        assert!(!unique.is_empty(), "overwrites should orphan snapshot-only blocks");
+        // Pre-delete: snapshot-only blocks are still pinned (allocated).
+        for b in &unique {
+            assert!(vol.allocator().is_allocated(*b));
+        }
+
+        block_on(vol.delete_snapshot(s0)).unwrap();
+        assert!(vol.snapshots().is_empty());
+        assert!(matches!(block_on(vol.get_in_snapshot(s0, &0)), Err(_)));
+
+        // Snapshot-only blocks reclaimed; live blocks retained.
+        for b in &unique {
+            assert!(!vol.allocator().is_allocated(*b), "block {b} should be reclaimed");
+        }
+        for b in &live_blocks {
+            assert!(vol.allocator().is_allocated(*b), "live block {b} must remain");
+        }
+        for k in 0..50u64 {
+            assert_eq!(block_on(vol.get(&k)).unwrap(), Some(k + 1000));
+        }
     }
 
     #[test]
