@@ -31,17 +31,23 @@ use crate::digest::Hasher;
 use crate::error::StorageError;
 use crate::snapshot::{self, SnapEntry};
 use crate::superblock::{self, Superblock};
-use crate::tree::{BlockPtr, Key, Record, Tree, Txn};
+use crate::tree::{BlockPtr, Key, Record, Tree};
+use crate::txg::Txg;
 
 /// A mounted RFS volume parameterized by key/value record types and the
 /// allocator/device implementations.
+///
+/// Writes accumulate in an open [`Txg`] (in-memory, coalesced) and become
+/// durable only at [`commit`](Volume::commit) / [`snapshot`](Volume::snapshot),
+/// which serialize the dirty nodes and publish a new root through the superblock
+/// ring.
 pub struct Volume<K, V, A, D> {
     dev: D,
     alloc: A,
     pool: BufferPool,
     hasher: Hasher,
     sb: Superblock,
-    tree: Tree<K, V>,
+    txg: Txg<K, V>,
     snaps: Vec<SnapEntry>,
 }
 
@@ -61,7 +67,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             pool,
             hasher,
             sb,
-            tree: Tree::empty(),
+            txg: Txg::begin(None),
             snaps: Vec::new(),
         })
     }
@@ -78,22 +84,18 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         let sb = superblock::open(&dev).await?;
         let hasher = Hasher::new(sb.digest)?;
         let mut pool = BufferPool::for_block_size(dev.block_size());
-        let tree = if sb.root_addr == 0 {
-            Tree::empty()
-        } else {
-            Tree::at(BlockPtr {
-                addr: sb.root_addr,
-                birth_txg: sb.root_birth_txg,
-                checksum: sb.root_checksum,
-            })
-        };
+        let root = root_ptr(&sb);
 
         // Mark-and-sweep: rebuild allocator free space from everything still
         // referenced — the live tree, the snapshot directory block, and every
         // snapshot's tree — so the volume is writable and snapshot-pinned blocks
         // are never handed out or reclaimed.
         let mut live: Vec<u64> = Vec::new();
-        tree.collect_blocks(&dev, &mut pool, hasher, &mut live).await?;
+        if let Some(r) = root {
+            Tree::<K, V>::at(r)
+                .collect_blocks(&dev, &mut pool, hasher, &mut live)
+                .await?;
+        }
 
         let mut snaps = Vec::new();
         if sb.snaplist_root != 0 {
@@ -119,9 +121,15 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             pool,
             hasher,
             sb,
-            tree,
+            txg: Txg::begin(root),
             snaps,
         })
+    }
+
+    /// The committed (durable) root pointer, or `None` for an empty tree.
+    #[must_use]
+    fn committed_root(&self) -> Option<BlockPtr> {
+        root_ptr(&self.sb)
     }
 
     /// The most recently committed transaction group.
@@ -141,21 +149,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Allocation, device, or verification errors.
     pub async fn insert(&mut self, key: K, val: V) -> Result<(), StorageError> {
-        // Tree is Copy (just a root pointer), so operate on a local copy and
-        // store it back — sidesteps borrowing several fields of `self` at once.
-        let keep_through_txg = self.youngest_snap_txg();
-        let mut tree = self.tree;
-        let mut txn = Txn {
-            txg: self.sb.txg + 1,
-            alloc: &mut self.alloc,
-            dev: &self.dev,
-            pool: &mut self.pool,
-            hasher: self.hasher,
-            keep_through_txg,
-        };
-        tree.insert(key, val, &mut txn).await?;
-        self.tree = tree;
-        Ok(())
+        self.txg.insert(key, val, &self.dev, &mut self.pool, self.hasher).await
     }
 
     /// Looks up `key` in the current (committed + open) tree.
@@ -163,7 +157,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Device or verification errors.
     pub async fn get(&mut self, key: &K) -> Result<Option<V>, StorageError> {
-        self.tree.get(key, &self.dev, &mut self.pool, self.hasher).await
+        self.txg.get(key, &self.dev, &mut self.pool, self.hasher).await
     }
 
     /// Removes `key` from the open transaction (not durable until
@@ -172,19 +166,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Allocation, device, or verification errors.
     pub async fn delete(&mut self, key: &K) -> Result<bool, StorageError> {
-        let keep_through_txg = self.youngest_snap_txg();
-        let mut tree = self.tree;
-        let mut txn = Txn {
-            txg: self.sb.txg + 1,
-            alloc: &mut self.alloc,
-            dev: &self.dev,
-            pool: &mut self.pool,
-            hasher: self.hasher,
-            keep_through_txg,
-        };
-        let removed = tree.delete(key, &mut txn).await?;
-        self.tree = tree;
-        Ok(removed)
+        self.txg.delete(key, &self.dev, &mut self.pool, self.hasher).await
     }
 
     /// Publishes the open transaction: stamps the tree root into a new superblock
@@ -197,15 +179,38 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Device errors from the superblock write.
     pub async fn commit(&mut self) -> Result<(), StorageError> {
-        let mut sb = self.sb;
-        sb.txg += 1;
-        stamp_root(&mut sb, self.tree.root);
+        let next = self.sb.txg + 1;
+        let youngest = self.youngest_snap_txg();
+        let cr = self.committed_root();
+        // Serialize the dirty shadow (each touched node written once).
+        let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
+        let (new_root, freed) = working
+            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .await?;
 
-        // The durability barrier. Only on success do we adopt the new superblock
-        // and let the allocator reuse blocks the old root no longer needs.
+        let mut sb = self.sb;
+        sb.txg = next;
+        stamp_root(&mut sb, new_root);
+
+        // The durability barrier. Only after the new root is durable do we free
+        // superseded blocks (birth-gated so snapshots keep what they pin).
         superblock::commit(&self.dev, &sb).await?;
         self.sb = sb;
+        self.txg = Txg::begin(new_root);
+        self.free_superseded(&freed, youngest)?;
         self.alloc.commit();
+        Ok(())
+    }
+
+    /// Frees blocks superseded this txg whose `birth_txg` shows no snapshot pins
+    /// them (`> youngest`). Staged frees are reclaimed by the caller's
+    /// `alloc.commit()`.
+    fn free_superseded(&mut self, freed: &[BlockPtr], youngest: u64) -> Result<(), StorageError> {
+        for ptr in freed {
+            if ptr.birth_txg > youngest {
+                self.alloc.free(ptr.addr)?;
+            }
+        }
         Ok(())
     }
 
@@ -220,21 +225,32 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// Allocation, device, or capacity errors.
     pub async fn snapshot(&mut self) -> Result<u64, StorageError> {
         let next = self.sb.txg + 1;
-        let id = self.snaps.iter().map(|s| s.id).max().map_or(0, |m| m + 1);
-        let root = self.tree.root.unwrap_or(BlockPtr::NULL);
+        let youngest = self.youngest_snap_txg();
+        let cr = self.committed_root();
+        let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
+        let (new_root, freed) = working
+            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .await?;
 
+        let id = self.snaps.iter().map(|s| s.id).max().map_or(0, |m| m + 1);
         let mut snaps = self.snaps.clone();
-        snaps.push(SnapEntry { id, txg: next, root });
+        snaps.push(SnapEntry {
+            id,
+            txg: next,
+            root: new_root.unwrap_or(BlockPtr::NULL),
+        });
         let snaplist_root = snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?;
 
         let mut sb = self.sb;
         sb.txg = next;
         sb.snaplist_root = snaplist_root;
-        stamp_root(&mut sb, self.tree.root);
+        stamp_root(&mut sb, new_root);
 
         superblock::commit(&self.dev, &sb).await?;
         self.sb = sb;
         self.snaps = snaps;
+        self.txg = Txg::begin(new_root);
+        self.free_superseded(&freed, youngest)?;
         self.alloc.commit();
         Ok(id)
     }
@@ -261,22 +277,33 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             .iter()
             .position(|s| s.id == id)
             .ok_or(StorageError::NotFound)?;
+
+        // Flush any pending writes so the committed root is current, then drop
+        // the entry. `gc` below recomputes allocator state, so superseded blocks
+        // need no separate freeing here.
+        let next = self.sb.txg + 1;
+        let cr = self.committed_root();
+        let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
+        let (new_root, _freed) = working
+            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .await?;
+
         let mut snaps = self.snaps.clone();
         snaps.remove(pos);
 
         let mut sb = self.sb;
-        sb.txg += 1;
+        sb.txg = next;
         sb.snaplist_root = if snaps.is_empty() {
             0
         } else {
             snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?
         };
-        stamp_root(&mut sb, self.tree.root);
+        stamp_root(&mut sb, new_root);
 
         superblock::commit(&self.dev, &sb).await?;
         self.sb = sb;
         self.snaps = snaps;
-        self.alloc.commit();
+        self.txg = Txg::begin(new_root);
 
         self.gc().await
     }
@@ -286,9 +313,11 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// freeing all unreachable blocks. Same computation `open` does, run online.
     async fn gc(&mut self) -> Result<(), StorageError> {
         let mut live = Vec::new();
-        self.tree
-            .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut live)
-            .await?;
+        if let Some(r) = self.committed_root() {
+            Tree::<K, V>::at(r)
+                .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut live)
+                .await?;
+        }
         if self.sb.snaplist_root != 0 {
             live.push(self.sb.snaplist_root);
             for snap in &self.snaps {
@@ -313,9 +342,11 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// Device or verification errors.
     pub async fn live_blocks(&mut self) -> Result<Vec<u64>, StorageError> {
         let mut out = Vec::new();
-        self.tree
-            .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut out)
-            .await?;
+        if let Some(r) = self.committed_root() {
+            Tree::<K, V>::at(r)
+                .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut out)
+                .await?;
+        }
         Ok(out)
     }
 
@@ -366,6 +397,19 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
                 .await?;
         }
         Ok(out)
+    }
+}
+
+/// Reconstructs the root pointer from a superblock (`None` if empty).
+fn root_ptr(sb: &Superblock) -> Option<BlockPtr> {
+    if sb.root_addr == 0 {
+        None
+    } else {
+        Some(BlockPtr {
+            addr: sb.root_addr,
+            birth_txg: sb.root_birth_txg,
+            checksum: sb.root_checksum,
+        })
     }
 }
 
@@ -601,6 +645,28 @@ mod tests {
                 "snapshot pins deleted {k}"
             );
         }
+    }
+
+    #[test]
+    fn txg_coalesces_repeated_writes() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        let before = vol.device().write_count();
+
+        // 500 updates to the SAME key in one transaction.
+        for i in 0..500u64 {
+            block_on(vol.insert(7, i)).unwrap();
+        }
+        // In-memory only: no device writes yet.
+        assert_eq!(vol.device().write_count(), before, "ops buffer in RAM");
+
+        block_on(vol.commit()).unwrap();
+        // Commit writes the single dirty leaf once + one superblock block — a
+        // small constant, NOT ~500. (Without coalescing this would be hundreds.)
+        let writes = vol.device().write_count() - before;
+        assert!(writes <= 4, "expected coalesced commit, got {writes} writes");
+        assert_eq!(block_on(vol.get(&7)).unwrap(), Some(499));
     }
 
     #[test]

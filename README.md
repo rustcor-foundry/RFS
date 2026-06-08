@@ -14,9 +14,10 @@ decoupled so a bug in one cannot silently corrupt another.
 > are writable via mark-and-sweep recovery, and **snapshots** pin state that
 > survives overwrites and remount. Below it: atomic superblock commit, a segment
 > allocator, the CoW Merkle B-tree with verify-on-read, and the hardware/transport
-> seams. Snapshot deletion/reclamation, the txg/ZIL layer, and the kernel/FUSE
-> adapters are next. *(2026-06-08: 42 passing tests, clippy-pedantic clean,
-> bare-metal RISC-V build green.)*
+> seams. Snapshots delete and reclaim space, and writes batch into a transaction
+> that coalesces (each touched node written once at commit). The ZIL and the
+> kernel/FUSE adapters are next. *(2026-06-08: 43 passing tests, clippy-pedantic
+> clean, bare-metal RISC-V build green.)*
 
 ## Why it's built this way
 
@@ -31,7 +32,7 @@ as traits with static dispatch.
 │  VFS / POSIX (inodes, dirs, symlinks)            [M7]      │
 ├──────────────────────────────────────────────────────────┤
 │  Volume: root publish via superblock commit      [M3] ✅   │
-│  Transactional object layer: txg batching + ZIL  [M4]      │
+│  Transactional layer: txg batching ✅ / ZIL      [M4] ◑    │
 ├──────────────────────────────────────────────────────────┤
 │  CoW Merkle B-tree (BlockPtr, verify-on-read)    [M3] ✅   │
 ├──────────────────────────────────────────────────────────┤
