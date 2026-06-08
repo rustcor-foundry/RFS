@@ -16,9 +16,10 @@ decoupled so a bug in one cannot silently corrupt another.
 > allocator, the CoW Merkle B-tree with verify-on-read, and the hardware/transport
 > seams. Snapshots delete and reclaim space; writes batch into a coalescing
 > transaction (each touched node written once at commit); and an intent log (ZIL)
-> makes `fsync`-style writes survive a crash. The kernel/FUSE adapters are next.
-> *(2026-06-08: 45 passing tests, clippy-pedantic clean, bare-metal RISC-V build
-> green.)*
+> makes `fsync`-style writes survive a crash. A randomized, model-checked
+> crash-recovery simulation hammers the whole stack with power-cuts and torn
+> commits. The VFS/POSIX layer and kernel/FUSE adapters are next. *(2026-06-08:
+> 46 passing tests, clippy-pedantic clean, bare-metal RISC-V build green.)*
 
 ## Why it's built this way
 
@@ -102,6 +103,16 @@ The same crate that targets bare metal runs in user space against an in-memory
   never a torn in-between.
 - *Flip a byte under a tree node* → `read_node` returns `BadChecksum`, proving the
   parent-checksum self-healing path.
+
+A randomized, **model-checked crash-recovery simulation**
+(`testkit::fuzz_crash_recovery`, driven by `src/sim.rs`) runs random sequences of
+insert/delete/fsync/commit with power-cuts and torn commits, asserting recovery
+always equals the last commit plus the `fsync`'d ops — never a torn or corrupt
+state. The same driver backs a `cargo fuzz` target (`fuzz/`, run on Linux):
+
+```sh
+cargo +nightly fuzz run crash_recovery     # coverage-guided, on Linux/macOS
+```
 
 This is the lower half of the eventual pipeline: in-memory → FUSE on desktop →
 `cargo fuzz` → bare-metal kernel, so corruption is caught in user space long

@@ -7,7 +7,8 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**45 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**46 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -34,9 +35,17 @@ and the **ZIL** — `sync_insert`/`sync_delete` make writes durable immediately 
 a reserved intent-log ring, replayed on mount. fsync'd writes survive a crash;
 un-synced ones may not; a full ring forces a commit.
 
-In progress: per-snapshot dead-lists (incremental delete, now batchable on the
-txg) and a persisted space map to avoid the full-tree scan on mount. Then M5
-(feox adapter).
+M6 (started): a **byte-driven, model-checked crash-recovery driver**
+(`testkit::fuzz_crash_recovery`) shared by a deterministic in-crate simulation
+(48 seeds × random insert/delete/fsync/commit/power-cut/torn-commit steps, each
+verified to recover exactly the last commit + fsync'd ops) and a `cargo fuzz`
+target under `fuzz/` (nightly/Linux). Reads validate every checksum, so the
+self-healing path is exercised too.
+
+Next in M6: run the libFuzzer campaign on a Linux host; the FUSE mount belongs
+*after* the VFS layer (it exposes POSIX semantics), so M7 comes first.
+
+Deferred optimizations: per-snapshot dead-lists; persisted space map.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -114,8 +123,12 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [ ] Power-cut fuzzing through the whole stack, including the ZIL tail (M6).
 - [ ] **M5 — `rfs-feox` adapter**: bridge `feox-nvme` async queues to
   `BlockDevice`, capability-revocation aware.
-- [ ] **M6 — FUSE testbed** (desktop) + `cargo fuzz` campaign.
-- [ ] **M7 — VFS / POSIX inode layer.**
+- [~] **M6 — crash-recovery fuzzing + FUSE testbed**:
+  - [x] Model-checked crash-recovery driver (`testkit::fuzz_crash_recovery`),
+    deterministic simulation test, and a `cargo fuzz` target (`fuzz/`).
+  - [ ] Run the libFuzzer campaign on Linux.
+  - [ ] FUSE mount (after M7 — it exposes the POSIX VFS).
+- [ ] **M7 — VFS / POSIX inode layer** (inodes, directories, paths over the KV tree).
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine
@@ -163,7 +176,9 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/zil.rs           intent log: reserved ring, sync writes + mount replay
   src/snapshot.rs      self-checksummed snapshot directory (SnapEntry)
   src/error.rs         StorageError incl. CapabilityRevoked / DeviceRemoved
-  src/testkit.rs       MemDevice (crash injection) + block_on  [feature: testkit]
+  src/testkit.rs       MemDevice (crash injection) + block_on + fuzz driver  [feature: testkit]
+  src/sim.rs           deterministic crash-recovery simulation  [cfg(test)]
+fuzz/                  cargo-fuzz target (nightly/Linux; excluded from workspace)
 ```
 
 ## Commands

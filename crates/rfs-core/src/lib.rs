@@ -39,6 +39,9 @@ pub mod zil;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+#[cfg(test)]
+mod sim;
+
 pub use allocator::{AllocError, Allocator, SegKind, SegmentAllocator, SegmentGeom};
 pub use buffer::{AlignedBuf, BufferPool, RegionKey};
 pub use checksum::DigestMode;
