@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**36 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**38 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -17,12 +17,15 @@ MVCC), and M3 inc.3 (`Volume`: root publish through the superblock commit —
 **first whole-stack crash-atomic transaction**: `insert → commit → reopen → get`
 survives, and a torn commit rolls back to the prior committed tree).
 
-Also done: mount-time **mark-and-sweep** allocator recovery — a remounted volume
-is now writable (new writes never overwrite live blocks; leaked CoW garbage is
-reclaimed; the whole tree is checksum-verified at mount).
+Also done: mount-time **mark-and-sweep** allocator recovery (writable remount,
+garbage reclaim, full-tree checksum verify), and **snapshots** — `Volume::snapshot`
+captures a root into a self-checksummed snapshot directory; `get_in_snapshot`
+reads pinned state; mark-and-sweep walks every snapshot tree so pinned blocks
+survive remount.
 
-In progress: M3 — birth-time reclamation + snapshot directory; persisted space
-map to avoid the full-tree scan on mount.
+In progress: M3 — snapshot *deletion* + birth-time/dead-list reclamation
+(free blocks held only by a deleted snapshot); proactive in-session freeing on
+CoW overwrite; persisted space map to avoid the full-tree scan on mount.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -82,7 +85,11 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     reopen → get` round-trip; torn-commit rolls back to prior tree.
   - [x] Mount-time mark-and-sweep allocator recovery — writable remount,
     garbage reclaim, full-tree checksum verify on mount.
-  - [ ] Birth-time/dead-list reclamation; snapshot directory.
+  - [x] Snapshots: `Volume::snapshot`/`get_in_snapshot`, self-checksummed
+    snapshot directory, mark-and-sweep walks snapshot trees (pinned blocks
+    survive remount).
+  - [ ] Snapshot delete + birth-time/dead-list reclamation; proactive free on
+    CoW overwrite.
   - [ ] Persisted space map (avoid full-tree scan on mount).
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
   nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
@@ -133,7 +140,8 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/tree/ptr.rs      BlockPtr {addr, birth_txg, checksum}
   src/tree/node.rs     B+-tree node codec + write_node/read_node (verify-on-read)
   src/tree/btree.rs    Tree::insert/get — CoW walk, splits, MVCC; Txn context
-  src/volume.rs        Volume: format/open/insert/get/commit (whole-stack txn)
+  src/volume.rs        Volume: format/open/insert/get/commit/snapshot (whole-stack txn)
+  src/snapshot.rs      self-checksummed snapshot directory (SnapEntry)
   src/error.rs         StorageError incl. CapabilityRevoked / DeviceRemoved
   src/testkit.rs       MemDevice (crash injection) + block_on  [feature: testkit]
 ```

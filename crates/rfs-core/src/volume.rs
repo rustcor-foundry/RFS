@@ -29,6 +29,7 @@ use crate::checksum::DigestMode;
 use crate::device::BlockDevice;
 use crate::digest::Hasher;
 use crate::error::StorageError;
+use crate::snapshot::{self, SnapEntry};
 use crate::superblock::{self, Superblock};
 use crate::tree::{BlockPtr, Key, Record, Tree, Txn};
 
@@ -41,6 +42,7 @@ pub struct Volume<K, V, A, D> {
     hasher: Hasher,
     sb: Superblock,
     tree: Tree<K, V>,
+    snaps: Vec<SnapEntry>,
 }
 
 impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
@@ -60,6 +62,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             hasher,
             sb,
             tree: Tree::empty(),
+            snaps: Vec::new(),
         })
     }
 
@@ -85,10 +88,26 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             })
         };
 
-        // Mark-and-sweep: rebuild allocator free space from the live tree so the
-        // volume is writable, never handing out a block the tree occupies.
+        // Mark-and-sweep: rebuild allocator free space from everything still
+        // referenced — the live tree, the snapshot directory block, and every
+        // snapshot's tree — so the volume is writable and snapshot-pinned blocks
+        // are never handed out or reclaimed.
         let mut live: Vec<u64> = Vec::new();
         tree.collect_blocks(&dev, &mut pool, hasher, &mut live).await?;
+
+        let mut snaps = Vec::new();
+        if sb.snaplist_root != 0 {
+            live.push(sb.snaplist_root);
+            snaps = snapshot::read(sb.snaplist_root, &dev, &mut pool).await?;
+            for snap in &snaps {
+                if !snap.root.is_null() {
+                    Tree::<K, V>::at(snap.root)
+                        .collect_blocks(&dev, &mut pool, hasher, &mut live)
+                        .await?;
+                }
+            }
+        }
+
         for block in live {
             alloc.mark_live(block)?;
         }
@@ -101,6 +120,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             hasher,
             sb,
             tree,
+            snaps,
         })
     }
 
@@ -172,6 +192,89 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.sb = sb;
         self.alloc.commit();
         Ok(())
+    }
+
+    /// Captures the current tree as a snapshot and commits. The snapshot pins the
+    /// committed state; later overwrites copy-on-write around it. Returns the new
+    /// snapshot id.
+    ///
+    /// (Space held only by snapshots is reclaimed when the snapshot is deleted —
+    /// a later increment; for now snapshots accumulate.)
+    ///
+    /// # Errors
+    /// Allocation, device, or capacity errors.
+    pub async fn snapshot(&mut self) -> Result<u64, StorageError> {
+        let next = self.sb.txg + 1;
+        let id = self.snaps.iter().map(|s| s.id).max().map_or(0, |m| m + 1);
+        let root = self.tree.root.unwrap_or(BlockPtr::NULL);
+
+        let mut snaps = self.snaps.clone();
+        snaps.push(SnapEntry { id, txg: next, root });
+        let snaplist_root = snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?;
+
+        let mut sb = self.sb;
+        sb.txg = next;
+        sb.snaplist_root = snaplist_root;
+        if let Some(ptr) = self.tree.root {
+            sb.root_addr = ptr.addr;
+            sb.root_birth_txg = ptr.birth_txg;
+            sb.root_checksum = ptr.checksum;
+        }
+
+        superblock::commit(&self.dev, &sb).await?;
+        self.sb = sb;
+        self.snaps = snaps;
+        self.alloc.commit();
+        Ok(id)
+    }
+
+    /// The recorded snapshots, oldest first.
+    #[must_use]
+    pub fn snapshots(&self) -> &[SnapEntry] {
+        &self.snaps
+    }
+
+    /// Borrows the allocator (e.g. to inspect free-space accounting in tests).
+    pub fn allocator(&self) -> &A {
+        &self.alloc
+    }
+
+    /// Looks up `key` as of snapshot `id`.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] for an unknown id, or device/verification errors.
+    pub async fn get_in_snapshot(&mut self, id: u64, key: &K) -> Result<Option<V>, StorageError> {
+        let root = self
+            .snaps
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.root)
+            .ok_or(StorageError::NotFound)?;
+        if root.is_null() {
+            return Ok(None);
+        }
+        Tree::<K, V>::at(root).get(key, &self.dev, &mut self.pool, self.hasher).await
+    }
+
+    /// Enumerates every block referenced by snapshot `id` (for replication,
+    /// verification, or tests).
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] for an unknown id, or device/verification errors.
+    pub async fn snapshot_blocks(&mut self, id: u64) -> Result<Vec<u64>, StorageError> {
+        let root = self
+            .snaps
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.root)
+            .ok_or(StorageError::NotFound)?;
+        let mut out = Vec::new();
+        if !root.is_null() {
+            Tree::<K, V>::at(root)
+                .collect_blocks(&self.dev, &mut self.pool, self.hasher, &mut out)
+                .await?;
+        }
+        Ok(out)
     }
 }
 
@@ -251,6 +354,70 @@ mod tests {
                 "key {k} must survive write-after-remount"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_pins_state_against_later_overwrites() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k)).unwrap();
+        }
+        let s0 = block_on(vol.snapshot()).unwrap(); // captures k => k
+
+        // Overwrite every key in the live tree.
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k + 1000)).unwrap();
+        }
+        block_on(vol.commit()).unwrap();
+
+        for k in 0..50u64 {
+            assert_eq!(block_on(vol.get(&k)).unwrap(), Some(k + 1000), "live updated");
+            assert_eq!(
+                block_on(vol.get_in_snapshot(s0, &k)).unwrap(),
+                Some(k),
+                "snapshot pins the old value"
+            );
+        }
+        assert!(matches!(block_on(vol.get_in_snapshot(404, &0)), Err(_)));
+    }
+
+    #[test]
+    fn snapshot_blocks_survive_remount_marked_live() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k)).unwrap();
+        }
+        let s0 = block_on(vol.snapshot()).unwrap();
+        for k in 0..50u64 {
+            block_on(vol.insert(k, k + 1000)).unwrap();
+        }
+        block_on(vol.commit()).unwrap();
+
+        // Remount with a fresh allocator: mark-and-sweep must walk the snapshot.
+        let media = vol.device().snapshot();
+        let mut vol2: Vol = block_on(Volume::open(media, fresh_alloc())).unwrap();
+
+        // Every block the snapshot references must be marked allocated — proving
+        // recovery walked the snapshot tree, not just the live tree.
+        let blocks = block_on(vol2.snapshot_blocks(s0)).unwrap();
+        assert!(!blocks.is_empty());
+        for b in blocks {
+            assert!(
+                vol2.allocator().is_allocated(b),
+                "snapshot block {b} must survive mark-and-sweep"
+            );
+        }
+
+        // And it still reads its pinned values, while live keeps the new ones.
+        for k in 0..50u64 {
+            assert_eq!(block_on(vol2.get_in_snapshot(s0, &k)).unwrap(), Some(k));
+            assert_eq!(block_on(vol2.get(&k)).unwrap(), Some(k + 1000));
+        }
+        assert_eq!(vol2.snapshots().len(), 1);
     }
 
     #[test]

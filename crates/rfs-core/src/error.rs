@@ -41,6 +41,8 @@ pub enum StorageError {
     Unsupported,
     /// The allocator has no free space.
     NoSpace,
+    /// A referenced object (e.g. a snapshot id) does not exist.
+    NotFound,
     /// Stored state failed structural validation.
     Corrupt(CorruptKind),
 }

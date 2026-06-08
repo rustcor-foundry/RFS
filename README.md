@@ -9,13 +9,14 @@ the survival traits of ZFS, Btrfs, and F2FS while keeping the layers strictly
 decoupled so a bug in one cannot silently corrupt another.
 
 > **Status: early, but real.** The bottom of the stack works end to end and is
-> tested: a `Volume` already does a whole-stack crash-atomic transaction —
-> `insert → commit → reopen → get` survives, and a torn commit rolls back to the
-> prior committed tree. Below it: atomic superblock commit, a segment allocator,
-> the CoW Merkle B-tree with verify-on-read, and the hardware/transport seams.
-> Snapshot reclamation, the txg/ZIL layer, and the kernel/FUSE adapters are next.
-> *(2026-06-08: 35 passing tests, clippy-pedantic clean, bare-metal RISC-V build
-> green.)*
+> tested: a `Volume` does whole-stack crash-atomic transactions
+> (`insert → commit → reopen → get` survives; a torn commit rolls back), remounts
+> are writable via mark-and-sweep recovery, and **snapshots** pin state that
+> survives overwrites and remount. Below it: atomic superblock commit, a segment
+> allocator, the CoW Merkle B-tree with verify-on-read, and the hardware/transport
+> seams. Snapshot deletion/reclamation, the txg/ZIL layer, and the kernel/FUSE
+> adapters are next. *(2026-06-08: 38 passing tests, clippy-pedantic clean,
+> bare-metal RISC-V build green.)*
 
 ## Why it's built this way
 
