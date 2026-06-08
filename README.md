@@ -18,9 +18,9 @@ decoupled so a bug in one cannot silently corrupt another.
 > transaction (each touched node written once at commit); and an intent log (ZIL)
 > makes `fsync`-style writes survive a crash. A randomized, model-checked
 > crash-recovery simulation hammers the whole stack with power-cuts and torn
-> commits. A **POSIX directory namespace** (inodes, directories, paths) runs on
-> top; file-data extents and the FUSE mount are next. *(2026-06-08: 51 passing
-> tests, clippy-pedantic clean, bare-metal RISC-V build green.)*
+> commits. A **POSIX-style filesystem** (inodes, directories, paths, and files
+> with checksummed extent data) runs on top; the FUSE mount is next. *(2026-06-08:
+> 54 passing tests, clippy-pedantic clean, bare-metal RISC-V build green.)*
 
 ## Why it's built this way
 
@@ -33,7 +33,7 @@ as traits with static dispatch.
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  VFS / POSIX (inodes, dirs, symlinks)            [M7]      │
-│  VFS: inodes, directories, paths                 [M7] ◑    │
+│  VFS: inodes, directories, paths, file extents   [M7] ✅   │
 ├──────────────────────────────────────────────────────────┤
 │  Volume: root publish via superblock commit      [M3] ✅   │
 │  Transactional layer: txg batching + ZIL         [M4] ✅   │

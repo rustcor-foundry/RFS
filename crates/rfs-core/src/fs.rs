@@ -24,7 +24,7 @@ use crate::allocator::Allocator;
 use crate::checksum::DigestMode;
 use crate::device::BlockDevice;
 use crate::error::StorageError;
-use crate::tree::{Key, Record, Value};
+use crate::tree::{BlockPtr, Key, MAX_CKSUM, Record, Value};
 use crate::volume::Volume;
 
 /// The root directory's inode number.
@@ -33,8 +33,8 @@ pub const ROOT_INO: u64 = 1;
 const KIND_SUPER: u8 = 0;
 const KIND_INODE: u8 = 1;
 const KIND_DIRENT: u8 = 2;
-/// First kind past `DIRENT`, used as an exclusive range bound for `readdir`.
-const KIND_DIRENT_END: u8 = 3;
+/// File-data extents; also the exclusive upper bound for the `DIRENT` range.
+const KIND_EXTENT: u8 = 3;
 
 /// POSIX file-type bits (high bits of `mode`).
 const S_IFMT: u32 = 0o17_0000;
@@ -71,6 +71,9 @@ impl FsKey {
     }
     const fn dirent(dir: u64, name_hash: u64) -> Self {
         Self::new(dir, KIND_DIRENT, name_hash)
+    }
+    const fn extent(ino: u64, block_off: u64) -> Self {
+        Self::new(ino, KIND_EXTENT, block_off)
     }
 }
 
@@ -160,11 +163,14 @@ pub enum FsValue {
     Inode(Inode),
     /// A directory-entry bucket (one or more entries sharing a name hash).
     Dirent(Vec<DirEntry>),
+    /// A file-data extent: a pointer to one data block.
+    Extent(BlockPtr),
 }
 
 const TAG_SUPER: u8 = 0;
 const TAG_INODE: u8 = 1;
 const TAG_DIRENT: u8 = 2;
+const TAG_EXTENT: u8 = 3;
 
 impl Value for FsValue {
     fn encoded_len(&self) -> usize {
@@ -174,6 +180,7 @@ impl Value for FsValue {
             Self::Dirent(entries) => {
                 2 + entries.iter().map(|e| 8 + 2 + e.name.len()).sum::<usize>()
             }
+            Self::Extent(_) => 16 + MAX_CKSUM,
         }
     }
 
@@ -204,6 +211,12 @@ impl Value for FsValue {
                     o += 10 + e.name.len();
                 }
             }
+            Self::Extent(ptr) => {
+                out[0] = TAG_EXTENT;
+                out[1..9].copy_from_slice(&ptr.addr.to_le_bytes());
+                out[9..17].copy_from_slice(&ptr.birth_txg.to_le_bytes());
+                out[17..17 + MAX_CKSUM].copy_from_slice(&ptr.checksum);
+            }
         }
     }
 
@@ -219,6 +232,15 @@ impl Value for FsValue {
                 size: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
                 mtime: u64::from_le_bytes(buf[17..25].try_into().unwrap()),
             }),
+            TAG_EXTENT => {
+                let mut checksum = [0u8; MAX_CKSUM];
+                checksum.copy_from_slice(&buf[17..17 + MAX_CKSUM]);
+                Self::Extent(BlockPtr {
+                    addr: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+                    birth_txg: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+                    checksum,
+                })
+            }
             _ => {
                 let count = usize::from(u16::from_le_bytes(buf[1..3].try_into().unwrap()));
                 let mut entries = Vec::with_capacity(count);
@@ -232,6 +254,12 @@ impl Value for FsValue {
                 }
                 Self::Dirent(entries)
             }
+        }
+    }
+
+    fn referenced_blocks(&self, out: &mut Vec<u64>) {
+        if let Self::Extent(ptr) = self {
+            out.push(ptr.addr);
         }
     }
 }
@@ -432,7 +460,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         self.vol
             .range(
                 FsKey::new(dir, KIND_DIRENT, 0),
-                FsKey::new(dir, KIND_DIRENT_END, 0),
+                FsKey::new(dir, KIND_EXTENT, 0),
                 &mut buckets,
             )
             .await?;
@@ -477,6 +505,135 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         let mut p = self.read_inode(parent).await?;
         p.nlink = p.nlink.saturating_sub(1);
         self.write_inode(parent, p).await?;
+        self.vol.commit().await
+    }
+
+    async fn get_extent(&mut self, ino: u64, block_off: u64) -> Result<Option<BlockPtr>, StorageError> {
+        match self.vol.get(&FsKey::extent(ino, block_off)).await? {
+            Some(FsValue::Extent(ptr)) => Ok(Some(ptr)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes `data` at byte `offset` in file `ino`, extending it if needed.
+    /// Block-granular copy-on-write: each touched block is read-modified into a
+    /// fresh data block and the old one is freed (birth-gated) at commit.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or I/O / verification errors.
+    // Within-block offsets are bounded by the block size, which fits `usize`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        let bs = self.vol.block_size();
+        let bs64 = bs as u64;
+        let mut inode = self.read_inode(ino).await?;
+
+        let mut written = 0usize;
+        while written < data.len() {
+            let pos = offset + written as u64;
+            let block_off = (pos / bs64) * bs64;
+            let within = (pos - block_off) as usize;
+            let n = core::cmp::min(data.len() - written, bs - within);
+
+            let mut buf = alloc::vec![0u8; bs];
+            if let Some(old) = self.get_extent(ino, block_off).await? {
+                self.vol.read_data_block(old, &mut buf).await?;
+                self.vol.free_data_block(old);
+            }
+            buf[within..within + n].copy_from_slice(&data[written..written + n]);
+            let ptr = self.vol.alloc_data_block(&buf).await?;
+            self.vol
+                .insert(FsKey::extent(ino, block_off), FsValue::Extent(ptr))
+                .await?;
+            written += n;
+        }
+
+        let end = offset + data.len() as u64;
+        if end > inode.size {
+            inode.size = end;
+        }
+        self.write_inode(ino, inode).await?;
+        self.vol.commit().await
+    }
+
+    /// Reads up to `len` bytes from byte `offset` of file `ino`. Bytes past EOF
+    /// are omitted; unwritten holes read as zero.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or I/O / verification errors.
+    // Within-block offsets are bounded by the block size, which fits `usize`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn read(&mut self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+        let bs = self.vol.block_size();
+        let bs64 = bs as u64;
+        let inode = self.read_inode(ino).await?;
+        if offset >= inode.size {
+            return Ok(Vec::new());
+        }
+        let end = core::cmp::min(offset + len as u64, inode.size);
+        let mut out = alloc::vec![0u8; (end - offset) as usize];
+
+        let mut pos = offset;
+        while pos < end {
+            let block_off = (pos / bs64) * bs64;
+            let within = (pos - block_off) as usize;
+            let n = core::cmp::min((end - pos) as usize, bs - within);
+            if let Some(ptr) = self.get_extent(ino, block_off).await? {
+                let mut buf = alloc::vec![0u8; bs];
+                self.vol.read_data_block(ptr, &mut buf).await?;
+                let o = (pos - offset) as usize;
+                out[o..o + n].copy_from_slice(&buf[within..within + n]);
+            }
+            pos += n as u64;
+        }
+        Ok(out)
+    }
+
+    /// Sets the size of file `ino`, freeing any data blocks fully beyond it.
+    /// (Growing leaves a sparse hole; shrinking reclaims trailing blocks.)
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or I/O errors.
+    // Within-block offsets are bounded by the block size, which fits `usize`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn truncate(&mut self, ino: u64, size: u64) -> Result<(), StorageError> {
+        let bs64 = self.vol.block_size() as u64;
+        let mut inode = self.read_inode(ino).await?;
+        let drop_from = size.div_ceil(bs64) * bs64; // first block fully past `size`
+
+        let mut exts = Vec::new();
+        self.vol
+            .range(
+                FsKey::extent(ino, drop_from),
+                FsKey::new(ino, KIND_EXTENT + 1, 0),
+                &mut exts,
+            )
+            .await?;
+        for (key, value) in exts {
+            if let FsValue::Extent(ptr) = value {
+                self.vol.free_data_block(ptr);
+            }
+            self.vol.delete(&key).await?;
+        }
+
+        // Zero the tail of the block straddling `size`, so a later grow reads
+        // zeros there (POSIX) rather than stale bytes.
+        let block_off = (size / bs64) * bs64;
+        let within = (size - block_off) as usize;
+        if within != 0
+            && let Some(old) = self.get_extent(ino, block_off).await?
+        {
+            let bs = self.vol.block_size();
+            let mut buf = alloc::vec![0u8; bs];
+            self.vol.read_data_block(old, &mut buf).await?;
+            buf[within..].fill(0);
+            self.vol.free_data_block(old);
+            let ptr = self.vol.alloc_data_block(&buf).await?;
+            self.vol.insert(FsKey::extent(ino, block_off), FsValue::Extent(ptr)).await?;
+        }
+
+        inode.size = size;
+        self.write_inode(ino, inode).await?;
         self.vol.commit().await
     }
 }
@@ -568,6 +725,62 @@ mod tests {
         let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"docs")).unwrap(), Some(docs));
         assert_eq!(names(block_on(fs.readdir(docs)).unwrap()), [b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn file_write_read_spanning_blocks_and_holes() {
+        let mut fs = fresh();
+        let f = block_on(fs.create(ROOT_INO, b"data", 0o644)).unwrap();
+
+        // Write across a block boundary (BS=4096): offset 4090, 20 bytes.
+        let payload: alloc::vec::Vec<u8> = (0..20u8).collect();
+        block_on(fs.write(f, 4090, &payload)).unwrap();
+        assert_eq!(block_on(fs.getattr(f)).unwrap().size, 4110);
+
+        // Read it back exactly.
+        assert_eq!(block_on(fs.read(f, 4090, 20)).unwrap(), payload);
+        // The gap [0, 4090) is a hole → zeros.
+        assert_eq!(block_on(fs.read(f, 0, 8)).unwrap(), [0u8; 8]);
+        // Read past EOF is bounded by size.
+        assert_eq!(block_on(fs.read(f, 4100, 1000)).unwrap().len(), 10);
+
+        // Overwrite within the first written block.
+        block_on(fs.write(f, 4090, &[0xAA, 0xBB])).unwrap();
+        let r = block_on(fs.read(f, 4090, 4)).unwrap();
+        assert_eq!(r, [0xAA, 0xBB, 2, 3]);
+    }
+
+    #[test]
+    fn file_data_survives_remount() {
+        let media;
+        let f;
+        {
+            let mut fs = fresh();
+            f = block_on(fs.create(ROOT_INO, b"big", 0o644)).unwrap();
+            let blob: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+            block_on(fs.write(f, 0, &blob)).unwrap();
+            media = fs.device().snapshot();
+        }
+        let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
+        let got = block_on(fs.read(f, 0, 10_000)).unwrap();
+        assert_eq!(got.len(), 10_000);
+        assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8));
+    }
+
+    #[test]
+    fn truncate_shrinks_and_grows() {
+        let mut fs = fresh();
+        let f = block_on(fs.create(ROOT_INO, b"t", 0o644)).unwrap();
+        let blob = alloc::vec![7u8; 20_000];
+        block_on(fs.write(f, 0, &blob)).unwrap();
+
+        block_on(fs.truncate(f, 5)).unwrap();
+        assert_eq!(block_on(fs.getattr(f)).unwrap().size, 5);
+        assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7u8; 5]);
+
+        // Grow back: the gap is a hole (zeros), not the old data.
+        block_on(fs.truncate(f, 10)).unwrap();
+        assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]);
     }
 
     #[test]
