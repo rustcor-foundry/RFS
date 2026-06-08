@@ -260,6 +260,70 @@ impl<K: Key, V: Record> Tree<K, V> {
         });
         Ok(())
     }
+
+    /// Removes `key`, returning whether it was present. Copy-on-write: the leaf
+    /// and every ancestor are rewritten to new blocks (old ones freed per the
+    /// birth-time rule), leaving the previous root intact.
+    ///
+    /// This does not merge or rebalance: an emptied leaf is retained (a lookup in
+    /// its range correctly reports "absent"), so the tree shape is preserved.
+    /// Structural compaction (merging underfull nodes, shrinking height) is a
+    /// later refinement. A delete of an absent key writes nothing.
+    ///
+    /// # Errors
+    /// Allocation, device, or verification errors.
+    pub async fn delete<A: Allocator, D: BlockDevice>(
+        &mut self,
+        key: &K,
+        txn: &mut Txn<'_, A, D>,
+    ) -> Result<bool, StorageError> {
+        let txg = txn.txg;
+        let dev = txn.dev;
+        let hasher = txn.hasher;
+        let keep = txn.keep_through_txg;
+
+        let Some(root_ptr) = self.root else {
+            return Ok(false);
+        };
+
+        let mut path: Vec<(Internal<K>, usize, BlockPtr)> = Vec::new();
+        let mut current = root_ptr;
+        let (mut leaf, leaf_old) = loop {
+            let here = current;
+            match read_node::<K, V, D>(&here, dev, &mut *txn.pool, hasher).await? {
+                Node::Leaf(l) => break (l, here),
+                Node::Internal(node) => {
+                    let idx = node.keys.partition_point(|sep| *sep <= *key);
+                    current = node.children[idx];
+                    path.push((node, idx, here));
+                }
+            }
+        };
+
+        // Absent key: change nothing (no writes, no frees, root unchanged).
+        let Ok(pos) = leaf.entries.binary_search_by(|(k, _)| k.cmp(key)) else {
+            return Ok(false);
+        };
+        leaf.entries.remove(pos);
+        leaf.generation = txg;
+
+        let mut child_ptr = put(&Node::Leaf(leaf), txn).await?;
+        if leaf_old.birth_txg > keep {
+            txn.alloc.free(leaf_old.addr)?;
+        }
+
+        while let Some((mut parent, idx, parent_old)) = path.pop() {
+            parent.children[idx] = child_ptr;
+            parent.generation = txg;
+            child_ptr = put(&Node::<K, V>::Internal(parent), txn).await?;
+            if parent_old.birth_txg > keep {
+                txn.alloc.free(parent_old.addr)?;
+            }
+        }
+
+        self.root = Some(child_ptr);
+        Ok(true)
+    }
 }
 
 /// Writes a node through the transaction: copy-on-write (new block, never
@@ -376,6 +440,48 @@ mod tests {
             matches!(root, Node::Internal(_)),
             "root should be internal after 200 inserts"
         );
+    }
+
+    #[test]
+    fn delete_removes_keys_and_reports_presence() {
+        let mut e = env();
+        let mut tree = Tree::<u64, u64>::empty();
+        for k in 0..100u64 {
+            block_on(tree.insert(k, k * 2, &mut txn(&mut e, k + 1))).unwrap();
+        }
+        // Delete the even keys.
+        for k in (0..100u64).step_by(2) {
+            assert!(block_on(tree.delete(&k, &mut txn(&mut e, 200))).unwrap());
+        }
+        // Deleting an absent key reports false.
+        assert!(!block_on(tree.delete(&0, &mut txn(&mut e, 201))).unwrap());
+        // Odd keys remain, even keys gone.
+        for k in 0..100u64 {
+            let got = block_on(tree.get(&k, &e.dev, &mut e.pool, e.hasher)).unwrap();
+            if k % 2 == 0 {
+                assert_eq!(got, None, "deleted {k}");
+            } else {
+                assert_eq!(got, Some(k * 2), "kept {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_all_then_reinsert() {
+        let mut e = env();
+        let mut tree = Tree::<u64, u64>::empty();
+        for k in 0..60u64 {
+            block_on(tree.insert(k, k, &mut txn(&mut e, k + 1))).unwrap();
+        }
+        for k in 0..60u64 {
+            assert!(block_on(tree.delete(&k, &mut txn(&mut e, 100))).unwrap());
+        }
+        for k in 0..60u64 {
+            assert_eq!(block_on(tree.get(&k, &e.dev, &mut e.pool, e.hasher)).unwrap(), None);
+        }
+        // Tree still usable after emptying.
+        block_on(tree.insert(7, 777, &mut txn(&mut e, 101))).unwrap();
+        assert_eq!(block_on(tree.get(&7, &e.dev, &mut e.pool, e.hasher)).unwrap(), Some(777));
     }
 
     #[test]

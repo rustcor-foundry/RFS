@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**39 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**42 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -95,6 +95,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     survive remount).
   - [x] Proactive free on CoW overwrite (birth-time gated) + `delete_snapshot`
     with online mark-and-sweep reclamation.
+  - [x] `Tree::delete` / `Volume::delete` — CoW key removal (no merge yet;
+    emptied leaves retained, lookups stay correct).
+  - [ ] Structural compaction on delete (merge underfull nodes, shrink height).
   - [ ] Per-snapshot dead-lists (incremental delete/free vs. full sweep).
   - [ ] Persisted space map (avoid full-tree scan on mount).
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write

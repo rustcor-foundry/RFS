@@ -166,6 +166,27 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.tree.get(key, &self.dev, &mut self.pool, self.hasher).await
     }
 
+    /// Removes `key` from the open transaction (not durable until
+    /// [`commit`](Self::commit)). Returns whether it was present.
+    ///
+    /// # Errors
+    /// Allocation, device, or verification errors.
+    pub async fn delete(&mut self, key: &K) -> Result<bool, StorageError> {
+        let keep_through_txg = self.youngest_snap_txg();
+        let mut tree = self.tree;
+        let mut txn = Txn {
+            txg: self.sb.txg + 1,
+            alloc: &mut self.alloc,
+            dev: &self.dev,
+            pool: &mut self.pool,
+            hasher: self.hasher,
+            keep_through_txg,
+        };
+        let removed = tree.delete(key, &mut txn).await?;
+        self.tree = tree;
+        Ok(removed)
+    }
+
     /// Publishes the open transaction: stamps the tree root into a new superblock
     /// and writes it to the ring (the durability barrier). On success advances
     /// the txg and drains the allocator's deferred frees.
@@ -544,6 +565,41 @@ mod tests {
         }
         for k in 0..50u64 {
             assert_eq!(block_on(vol.get(&k)).unwrap(), Some(k + 1000));
+        }
+    }
+
+    #[test]
+    fn delete_is_durable_and_snapshots_pin_deleted_keys() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        for k in 0..40u64 {
+            block_on(vol.insert(k, k)).unwrap();
+        }
+        let s0 = block_on(vol.snapshot()).unwrap(); // pins 0..40
+
+        // Delete the first 20 from the live tree, commit.
+        for k in 0..20u64 {
+            assert!(block_on(vol.delete(&k)).unwrap());
+        }
+        assert!(!block_on(vol.delete(&999)).unwrap());
+        block_on(vol.commit()).unwrap();
+
+        // Remount: deletions persisted, but the snapshot still has them.
+        let media = vol.device().snapshot();
+        let mut vol2: Vol = block_on(Volume::open(media, fresh_alloc())).unwrap();
+        for k in 0..40u64 {
+            let live = block_on(vol2.get(&k)).unwrap();
+            if k < 20 {
+                assert_eq!(live, None, "deleted {k} stays gone after remount");
+            } else {
+                assert_eq!(live, Some(k));
+            }
+            assert_eq!(
+                block_on(vol2.get_in_snapshot(s0, &k)).unwrap(),
+                Some(k),
+                "snapshot pins deleted {k}"
+            );
         }
     }
 

@@ -15,7 +15,7 @@ decoupled so a bug in one cannot silently corrupt another.
 > survives overwrites and remount. Below it: atomic superblock commit, a segment
 > allocator, the CoW Merkle B-tree with verify-on-read, and the hardware/transport
 > seams. Snapshot deletion/reclamation, the txg/ZIL layer, and the kernel/FUSE
-> adapters are next. *(2026-06-08: 39 passing tests, clippy-pedantic clean,
+> adapters are next. *(2026-06-08: 42 passing tests, clippy-pedantic clean,
 > bare-metal RISC-V build green.)*
 
 ## Why it's built this way
