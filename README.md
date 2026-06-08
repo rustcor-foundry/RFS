@@ -19,8 +19,9 @@ decoupled so a bug in one cannot silently corrupt another.
 > makes `fsync`-style writes survive a crash. A randomized, model-checked
 > crash-recovery simulation hammers the whole stack with power-cuts and torn
 > commits. A **POSIX-style filesystem** (inodes, directories, paths, and files
-> with checksummed extent data) runs on top; the FUSE mount is next. *(2026-06-08:
-> 54 passing tests, clippy-pedantic clean, bare-metal RISC-V build green.)*
+> with checksummed extent data) runs on top, and it **mounts on Linux via FUSE**
+> as a real directory (verified persistent across remount). *(2026-06-08: 54
+> passing tests, clippy-pedantic clean, bare-metal RISC-V build green.)*
 
 ## Why it's built this way
 
@@ -33,7 +34,7 @@ as traits with static dispatch.
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  VFS / POSIX (inodes, dirs, symlinks)            [M7]      │
-│  VFS: inodes, directories, paths, file extents   [M7] ✅   │
+│  VFS: inodes, dirs, paths, extents  + FUSE mount [M7] ✅   │
 ├──────────────────────────────────────────────────────────┤
 │  Volume: root publish via superblock commit      [M3] ✅   │
 │  Transactional layer: txg batching + ZIL         [M4] ✅   │
@@ -78,6 +79,23 @@ cargo build -p rfs-core --target riscv64gc-unknown-none-elf   # bare-metal proof
 
 Requires a recent stable Rust (edition 2024; developed on 1.94). Add the target
 with `rustup target add riscv64gc-unknown-none-elf`.
+
+## Mount it (Linux)
+
+The same engine compiles for a desktop FUSE target (`rfs-fuse/`, std + `fuser`),
+so you can mount an RFS image as a real directory:
+
+```sh
+sudo apt install fuse3 libfuse3-dev pkg-config        # once
+cd rfs-fuse && cargo build
+./target/debug/rfs-fuse /tmp/rfs.img /tmp/mnt &        # formats a fresh image
+mkdir /tmp/mnt/docs && echo hello > /tmp/mnt/docs/a.txt
+cat /tmp/mnt/docs/a.txt && ls -lR /tmp/mnt
+fusermount3 -u /tmp/mnt                                # data persists in the image
+```
+
+Verified end to end on WSL: directory trees, files, append, delete, and a 200 KB
+file all survive an unmount/remount with matching checksums.
 
 ## Repository layout
 

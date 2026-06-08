@@ -131,11 +131,13 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [ ] Power-cut fuzzing through the whole stack, including the ZIL tail (M6).
 - [ ] **M5 — `rfs-feox` adapter**: bridge `feox-nvme` async queues to
   `BlockDevice`, capability-revocation aware.
-- [~] **M6 — crash-recovery fuzzing + FUSE testbed**:
+- [x] **M6 — crash-recovery fuzzing + FUSE testbed**:
   - [x] Model-checked crash-recovery driver (`testkit::fuzz_crash_recovery`),
     deterministic simulation test, and a `cargo fuzz` target (`fuzz/`).
-  - [ ] Run the libFuzzer campaign on Linux.
-  - [ ] FUSE mount (after M7 — it exposes the POSIX VFS).
+  - [x] libFuzzer campaign runs on Linux (WSL): 2340 deep execs, no failures.
+  - [x] FUSE mount (`rfs-fuse/`, std + `fuser`): mounts a file-backed image as a
+    real directory; verified mkdir/write/cat/ls/rm and persistence across
+    remount (200 KB file SHA-256 matches).
 - [~] **M7 — VFS / POSIX inode layer** (inodes, directories, paths over the KV tree):
   - [x] Phase 1: variable-length leaf values (`Value` trait; Btrfs "fixed key,
     variable item data"). Leaves pack length-prefixed values and split by bytes;
@@ -146,7 +148,8 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] Phase 2b: file data via extents — `read`/`write`/`truncate`,
     block-granular CoW, checksummed data blocks, birth-gated free, sparse holes;
     `Value::referenced_blocks` so mark-and-sweep keeps data blocks live.
-  - [ ] Phase 2c: per-op batching (FS ops commit-per-op today); FUSE mount.
+  - [x] FUSE mount on Linux (`rfs-fuse/`) — RFS works as a real mounted directory.
+  - [ ] Phase 2c: per-op batching (FS ops commit-per-op today).
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine
@@ -198,6 +201,7 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/testkit.rs       MemDevice (crash injection) + block_on + fuzz driver  [feature: testkit]
   src/sim.rs           deterministic crash-recovery simulation  [cfg(test)]
 fuzz/                  cargo-fuzz target (nightly/Linux; excluded from workspace)
+rfs-fuse/              FUSE adapter — mounts a Filesystem on Linux (excluded)
 ```
 
 ## Commands
