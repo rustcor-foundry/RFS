@@ -8,19 +8,20 @@
 //! * `commit` publishes the new root by stamping it into the superblock and
 //!   writing the superblock ring — the single durability barrier. Deferred frees
 //!   are drained only *after* the new root is durable.
-//! * `open` recovers the newest consistent superblock and reconstructs the tree
-//!   from its root pointer.
+//! * `open` recovers the newest consistent superblock, reconstructs the tree
+//!   from its root pointer, and rebuilds the allocator by **mark-and-sweep**:
+//!   it walks every reachable block and marks it live, so a remounted volume is
+//!   immediately safe to write to (and leaked copy-on-write garbage is reclaimed
+//!   as a side effect). The walk also checksum-verifies the whole tree at mount.
 //!
 //! This is a minimal precursor to the M4 transaction layer (one open txg at a
 //! time, no batching/ZIL yet) and the first end-to-end power-cut-safe path.
 //!
-//! ## Known limitation (until allocator persistence lands)
-//!
-//! The allocator's free-space map is in-memory and is *not* yet rebuilt on
-//! `open`, so a freshly opened volume is **read-consistent but not yet safe to
-//! write to** — new allocations would not know which blocks the loaded tree
-//! occupies. Mounting for read-back (the durability guarantee) is sound today;
-//! space-map persistence / mark-and-sweep recovery is a later milestone.
+//! Recovery currently does a full tree scan on `open`; a persisted space map to
+//! avoid that is a later optimization. Birth-time/dead-list snapshot reclamation
+//! is also still pending.
+
+use alloc::vec::Vec;
 
 use crate::allocator::Allocator;
 use crate::buffer::BufferPool;
@@ -70,10 +71,10 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     ///
     /// # Errors
     /// Device errors, no valid superblock, or an unsupported digest mode.
-    pub async fn open(dev: D, alloc: A) -> Result<Self, StorageError> {
+    pub async fn open(dev: D, mut alloc: A) -> Result<Self, StorageError> {
         let sb = superblock::open(&dev).await?;
         let hasher = Hasher::new(sb.digest)?;
-        let pool = BufferPool::for_block_size(dev.block_size());
+        let mut pool = BufferPool::for_block_size(dev.block_size());
         let tree = if sb.root_addr == 0 {
             Tree::empty()
         } else {
@@ -83,6 +84,16 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
                 checksum: sb.root_checksum,
             })
         };
+
+        // Mark-and-sweep: rebuild allocator free space from the live tree so the
+        // volume is writable, never handing out a block the tree occupies.
+        let mut live: Vec<u64> = Vec::new();
+        tree.collect_blocks(&dev, &mut pool, hasher, &mut live).await?;
+        for block in live {
+            alloc.mark_live(block)?;
+        }
+        alloc.finish_rebuild();
+
         Ok(Self {
             dev,
             alloc,
@@ -206,6 +217,40 @@ mod tests {
             );
         }
         assert_eq!(block_on(reopened.get(&9999)).unwrap(), None);
+    }
+
+    #[test]
+    fn remount_is_writable_without_corrupting_prior_data() {
+        // Batch 1: commit keys 0..100 (txg 2).
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        for k in 0..100u64 {
+            block_on(vol.insert(k, k + 1)).unwrap();
+        }
+        block_on(vol.commit()).unwrap();
+
+        // Remount with a *fresh* allocator (mark-and-sweep rebuilds it), then
+        // write batch 2 (keys 100..200) and commit. New allocations must not
+        // overwrite batch-1 blocks.
+        let media = vol.device().snapshot();
+        let mut vol2: Vol = block_on(Volume::open(media, fresh_alloc())).unwrap();
+        for k in 100..200u64 {
+            block_on(vol2.insert(k, k + 1)).unwrap();
+        }
+        block_on(vol2.commit()).unwrap();
+        assert_eq!(vol2.committed_txg(), 3);
+
+        // Remount once more: both batches must be intact.
+        let media2 = vol2.device().snapshot();
+        let mut vol3: Vol = block_on(Volume::open(media2, fresh_alloc())).unwrap();
+        for k in 0..200u64 {
+            assert_eq!(
+                block_on(vol3.get(&k)).unwrap(),
+                Some(k + 1),
+                "key {k} must survive write-after-remount"
+            );
+        }
     }
 
     #[test]

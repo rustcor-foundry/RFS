@@ -103,6 +103,34 @@ impl<K: Key, V: Record> Tree<K, V> {
         }
     }
 
+    /// Appends every block reachable from the root to `out` (the mark phase of
+    /// mount-time mark-and-sweep). Reads — and therefore checksum-verifies —
+    /// every node, so a corrupt tree is detected at mount.
+    ///
+    /// # Errors
+    /// Device or verification errors.
+    pub async fn collect_blocks<D: BlockDevice>(
+        &self,
+        dev: &D,
+        pool: &mut BufferPool,
+        hasher: Hasher,
+        out: &mut Vec<u64>,
+    ) -> Result<(), StorageError> {
+        let Some(root) = self.root else {
+            return Ok(());
+        };
+        let mut stack = alloc::vec![root];
+        while let Some(ptr) = stack.pop() {
+            out.push(ptr.addr);
+            if let Node::Internal(node) = read_node::<K, V, D>(&ptr, dev, pool, hasher).await? {
+                for child in &node.children {
+                    stack.push(*child);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Inserts or updates `key => val`, copying every node on the root path and
     /// leaving the previous root intact (MVCC). Updates [`self.root`](Self::root)
     /// to the new root pointer.

@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**35 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**36 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -17,8 +17,12 @@ MVCC), and M3 inc.3 (`Volume`: root publish through the superblock commit —
 **first whole-stack crash-atomic transaction**: `insert → commit → reopen → get`
 survives, and a torn commit rolls back to the prior committed tree).
 
-In progress: M3 — birth-time reclamation + snapshot directory; allocator
-persistence / mark-and-sweep so a remounted volume is writable.
+Also done: mount-time **mark-and-sweep** allocator recovery — a remounted volume
+is now writable (new writes never overwrite live blocks; leaked CoW garbage is
+reclaimed; the whole tree is checksum-verified at mount).
+
+In progress: M3 — birth-time reclamation + snapshot directory; persisted space
+map to avoid the full-tree scan on mount.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -76,8 +80,10 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     height growth, MVCC (old root intact). `Txn` write context.
   - [x] `Volume` — root publish via superblock commit; `insert → commit →
     reopen → get` round-trip; torn-commit rolls back to prior tree.
-  - [ ] Allocator persistence / mark-and-sweep recovery (write after remount).
+  - [x] Mount-time mark-and-sweep allocator recovery — writable remount,
+    garbage reclaim, full-tree checksum verify on mount.
   - [ ] Birth-time/dead-list reclamation; snapshot directory.
+  - [ ] Persisted space map (avoid full-tree scan on mount).
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
   nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
   fuzzing through the whole stack, including the ZIL tail.
