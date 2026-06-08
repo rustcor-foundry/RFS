@@ -1,0 +1,17 @@
+[package]
+name = "rfs-core"
+description = "RFS engine core: device seam, on-disk superblock ring, atomic commit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# `testkit` exposes the in-memory crash-injecting device + a poll-once block_on.
+# It pulls in `alloc` only; it never pulls in `std`, so it can be reused for
+# on-target experiments later. Enabled automatically under `cfg(test)`.
+default = []
+testkit = []
+
+[lints]
+workspace = true
