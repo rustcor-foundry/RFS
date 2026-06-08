@@ -23,15 +23,15 @@
 
 use alloc::vec::Vec;
 
-use crate::allocator::Allocator;
+use crate::allocator::{Allocator, SegKind};
 use crate::buffer::BufferPool;
 use crate::checksum::DigestMode;
 use crate::device::BlockDevice;
 use crate::digest::Hasher;
-use crate::error::StorageError;
+use crate::error::{CorruptKind, StorageError};
 use crate::snapshot::{self, SnapEntry};
 use crate::superblock::{self, Superblock};
-use crate::tree::{BlockPtr, Key, Tree, Value};
+use crate::tree::{BlockPtr, Key, MAX_CKSUM, Tree, Value};
 use crate::txg::Txg;
 use crate::zil::{self, ZIL_CAPACITY, ZilRecord};
 
@@ -52,6 +52,8 @@ pub struct Volume<K, V, A, D> {
     snaps: Vec<SnapEntry>,
     /// Next ZIL sequence number to write (records pending since last commit).
     zil_seq: u64,
+    /// Out-of-tree data blocks superseded this txg, freed (birth-gated) at commit.
+    data_free: Vec<BlockPtr>,
 }
 
 impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
@@ -73,6 +75,7 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             txg: Txg::begin(None),
             snaps: Vec::new(),
             zil_seq: 0,
+            data_free: Vec::new(),
         })
     }
 
@@ -152,6 +155,7 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             txg,
             snaps,
             zil_seq,
+            data_free: Vec::new(),
         })
     }
 
@@ -207,6 +211,55 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
                 .await?;
         }
         Ok(())
+    }
+
+    /// The device block size — the unit of file-data extents.
+    #[must_use]
+    pub fn block_size(&self) -> usize {
+        self.dev.block_size()
+    }
+
+    /// Allocates a fresh data block, writes `data` (exactly one block), checksums
+    /// it, and returns a pointer stamped with the current transaction's `txg`.
+    /// Becomes durable when the caller next commits; reclaimed on crash otherwise.
+    ///
+    /// # Errors
+    /// Allocation or device errors.
+    pub async fn alloc_data_block(&mut self, data: &[u8]) -> Result<BlockPtr, StorageError> {
+        let addr = self.alloc.alloc(SegKind::Data)?;
+        self.dev.write_block(addr, data).await?;
+        let mut checksum = [0u8; MAX_CKSUM];
+        self.hasher.hash(data, &mut checksum);
+        Ok(BlockPtr {
+            addr,
+            birth_txg: self.sb.txg + 1,
+            checksum,
+        })
+    }
+
+    /// Reads a data block into `out` and verifies its checksum (self-healing).
+    ///
+    /// # Errors
+    /// Device errors or [`CorruptKind::BadChecksum`].
+    pub async fn read_data_block(
+        &mut self,
+        ptr: BlockPtr,
+        out: &mut [u8],
+    ) -> Result<(), StorageError> {
+        self.dev.read_block(ptr.addr, out).await?;
+        let mut got = [0u8; MAX_CKSUM];
+        self.hasher.hash(out, &mut got);
+        let len = self.hasher.output_len();
+        if got[..len] != ptr.checksum[..len] {
+            return Err(StorageError::Corrupt(CorruptKind::BadChecksum));
+        }
+        Ok(())
+    }
+
+    /// Stages a data block for freeing at the next commit (birth-gated, so a
+    /// snapshot keeps what it pins). The block stays readable until then.
+    pub fn free_data_block(&mut self, ptr: BlockPtr) {
+        self.data_free.push(ptr);
     }
 
     /// Removes `key` from the open transaction (not durable until
@@ -292,6 +345,8 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.txg = Txg::begin(new_root);
         self.zil_seq = 0; // ZIL records are now folded into the committed tree
         self.free_superseded(&freed, youngest)?;
+        let data_free = core::mem::take(&mut self.data_free);
+        self.free_superseded(&data_free, youngest)?;
         self.alloc.commit();
         Ok(())
     }
@@ -346,6 +401,8 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.txg = Txg::begin(new_root);
         self.zil_seq = 0;
         self.free_superseded(&freed, youngest)?;
+        let data_free = core::mem::take(&mut self.data_free);
+        self.free_superseded(&data_free, youngest)?;
         self.alloc.commit();
         Ok(id)
     }
@@ -400,6 +457,7 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.snaps = snaps;
         self.txg = Txg::begin(new_root);
         self.zil_seq = 0;
+        self.data_free.clear(); // gc() below recomputes allocator state
 
         self.gc().await
     }

@@ -46,6 +46,10 @@ pub trait Value: Clone {
 
     /// Parses from `buf`, which is exactly the stored byte slice.
     fn decode(buf: &[u8]) -> Self;
+
+    /// Appends any out-of-tree block addresses this value references (e.g. file
+    /// data extents) so mark-and-sweep keeps them live. Defaults to none.
+    fn referenced_blocks(&self, _out: &mut alloc::vec::Vec<u64>) {}
 }
 
 impl Record for u64 {

@@ -131,9 +131,17 @@ impl<K: Key, V: Value> Tree<K, V> {
         let mut stack = alloc::vec![root];
         while let Some(ptr) = stack.pop() {
             out.push(ptr.addr);
-            if let Node::Internal(node) = read_node::<K, V, D>(&ptr, dev, pool, hasher).await? {
-                for child in &node.children {
-                    stack.push(*child);
+            match read_node::<K, V, D>(&ptr, dev, pool, hasher).await? {
+                Node::Internal(node) => {
+                    for child in &node.children {
+                        stack.push(*child);
+                    }
+                }
+                Node::Leaf(leaf) => {
+                    // Values may reference out-of-tree blocks (file-data extents).
+                    for (_, v) in &leaf.entries {
+                        v.referenced_blocks(out);
+                    }
                 }
             }
         }

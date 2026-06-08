@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**51 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+**54 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
 bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
@@ -35,11 +35,13 @@ and the **ZIL** — `sync_insert`/`sync_delete` make writes durable immediately 
 a reserved intent-log ring, replayed on mount. fsync'd writes survive a crash;
 un-synced ones may not; a full ring forces a commit.
 
-M7 (in progress): variable-length values done; the **VFS directory namespace**
-is up — `Filesystem` over `FsKey (object_id, kind, k2)` with inode/dirent records,
-a tree **range scan**, and `mkdir`/`create`/`lookup`/`resolve`/`readdir`/
-`getattr`/`unlink`/`rmdir`. Collision-safe dirents (name-list buckets). Survives
-remount. Next: **file data via extents** (`read`/`write`, data-block lifecycle).
+M7 (functionally complete): a POSIX-ish `Filesystem` over `FsKey (object_id,
+kind, k2)` — inodes, directories (`mkdir`/`create`/`lookup`/`resolve`/`readdir`/
+`getattr`/`unlink`/`rmdir`, collision-safe dirent buckets), and **file data via
+extents** (`read`/`write`/`truncate`, block-granular CoW, checksummed data
+blocks, birth-gated freeing, sparse holes). mark-and-sweep follows extent
+pointers (`Value::referenced_blocks`) so file data survives reclamation/remount.
+Next: per-op batching (vs commit-per-op) and the FUSE mount on Linux.
 
 M6 (started): a **byte-driven, model-checked crash-recovery driver**
 (`testkit::fuzz_crash_recovery`) shared by a deterministic in-crate simulation
@@ -141,8 +143,10 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] Phase 2a: VFS namespace — `FsKey (object_id, kind, k2)`, inode/dirent
     records, tree range scan, `Filesystem` (mkdir/create/lookup/resolve/readdir/
     getattr/unlink/rmdir), collision-safe dirent buckets, remount-durable.
-  - [ ] Phase 2b: file data via extents (`read`/`write`, data-block lifecycle,
-    truncate), then per-op batching instead of commit-per-op.
+  - [x] Phase 2b: file data via extents — `read`/`write`/`truncate`,
+    block-granular CoW, checksummed data blocks, birth-gated free, sparse holes;
+    `Value::referenced_blocks` so mark-and-sweep keeps data blocks live.
+  - [ ] Phase 2c: per-op batching (FS ops commit-per-op today); FUSE mount.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine
