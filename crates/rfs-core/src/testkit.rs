@@ -6,13 +6,18 @@
 //! safe state. It uses only `core` + `alloc`, so the same harness can later run
 //! on-target, not just on the desktop.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::task::{Context, Poll, Waker};
 
+use crate::allocator::{SegmentAllocator, SegmentGeom};
+use crate::checksum::DigestMode;
 use crate::device::{BlockDevice, Deallocate};
 use crate::error::StorageError;
+use crate::volume::Volume;
+use crate::zil::ZIL_CAPACITY;
 
 /// Drives a future to completion by polling in a loop.
 ///
@@ -176,6 +181,124 @@ impl Deallocate for MemDevice {
         self.trimmed.set(self.trimmed.get() + count);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crash-recovery fuzz driver (shared by the in-crate simulation and the
+// libFuzzer target under `fuzz/`).
+// ---------------------------------------------------------------------------
+
+const FUZZ_BS: usize = 256;
+const FUZZ_BLOCKS: u64 = 65_536;
+const FUZZ_KEYS: u64 = 48;
+
+type FuzzVol = Volume<u64, u64, SegmentAllocator, MemDevice>;
+
+fn fuzz_alloc() -> SegmentAllocator {
+    SegmentAllocator::new(SegmentGeom::new(FUZZ_BLOCKS, 64, 1).unwrap())
+}
+
+fn next_byte(data: &[u8], pos: &mut usize) -> u8 {
+    let b = data.get(*pos).copied().unwrap_or(0);
+    *pos += 1;
+    b
+}
+
+fn fuzz_check(vol: &mut FuzzVol, model: &BTreeMap<u64, u64>) {
+    for k in 0..FUZZ_KEYS {
+        assert_eq!(
+            block_on(vol.get(&k)).unwrap(),
+            model.get(&k).copied(),
+            "key {k} mismatch vs durability model"
+        );
+    }
+}
+
+fn fuzz_drain(
+    vol: &mut FuzzVol,
+    working: &BTreeMap<u64, u64>,
+    durable: &mut BTreeMap<u64, u64>,
+    pending: &mut u64,
+) {
+    if *pending >= ZIL_CAPACITY - 1 {
+        block_on(vol.commit()).unwrap();
+        durable.clone_from(working);
+        *pending = 0;
+    }
+}
+
+/// Drives a [`Volume`] from an arbitrary byte string, model-checking that crash
+/// recovery always yields the last committed state plus `fsync`'d (ZIL) ops —
+/// never a torn/corrupt in-between. Each byte stream decodes to a sequence of
+/// insert / delete / sync / commit / crash steps.
+///
+/// Shared by the deterministic simulation test and the `cargo fuzz` target.
+///
+/// # Panics
+/// On any divergence from the durability model (that *is* the test).
+pub fn fuzz_crash_recovery(data: &[u8]) {
+    let dev = MemDevice::new(FUZZ_BS, FUZZ_BLOCKS);
+    let mut vol: FuzzVol =
+        block_on(Volume::format(dev, fuzz_alloc(), DigestMode::Fast64)).unwrap();
+
+    let mut working: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut durable: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut pending: u64 = 0;
+    let mut pos = 0usize;
+    let mut steps = 0u32;
+
+    while pos < data.len() && steps < 4096 {
+        steps += 1;
+        let op = next_byte(data, &mut pos);
+        let key = u64::from(next_byte(data, &mut pos)) % FUZZ_KEYS;
+        match op % 8 {
+            0..=2 => {
+                let v = u64::from(next_byte(data, &mut pos));
+                block_on(vol.insert(key, v)).unwrap();
+                working.insert(key, v);
+            }
+            3 => {
+                block_on(vol.delete(&key)).unwrap();
+                working.remove(&key);
+            }
+            4 => {
+                fuzz_drain(&mut vol, &working, &mut durable, &mut pending);
+                let v = u64::from(next_byte(data, &mut pos));
+                block_on(vol.sync_insert(key, v)).unwrap();
+                working.insert(key, v);
+                durable.insert(key, v);
+                pending += 1;
+            }
+            5 => {
+                fuzz_drain(&mut vol, &working, &mut durable, &mut pending);
+                block_on(vol.sync_delete(&key)).unwrap();
+                working.remove(&key);
+                durable.remove(&key);
+                pending += 1;
+            }
+            6 => {
+                block_on(vol.commit()).unwrap();
+                durable.clone_from(&working);
+                pending = 0;
+            }
+            _ => {
+                let tear = next_byte(data, &mut pos);
+                if tear & 1 == 0 {
+                    // Tear a commit mid-write: it must leave no trace.
+                    vol.device().set_write_budget(Some(u64::from(tear) + 1));
+                    let _ = block_on(vol.commit());
+                }
+                let media = vol.device().snapshot();
+                vol = block_on(Volume::open(media, fuzz_alloc())).unwrap();
+                fuzz_check(&mut vol, &durable);
+                working.clone_from(&durable);
+            }
+        }
+    }
+
+    let media = vol.device().snapshot();
+    let mut vol = block_on(Volume::open(media, fuzz_alloc())).unwrap();
+    fuzz_check(&mut vol, &durable);
 }
 
 #[cfg(test)]

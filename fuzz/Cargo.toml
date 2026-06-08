@@ -1,0 +1,30 @@
+# cargo-fuzz package — run on Linux/macOS with a nightly toolchain:
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run crash_recovery
+# Not part of the workspace (see ../Cargo.toml `exclude`), so it never affects
+# the stable cross-platform build/test.
+[package]
+name = "rfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rfs-core]
+path = "../crates/rfs-core"
+features = ["testkit"]
+
+[[bin]]
+name = "crash_recovery"
+path = "fuzz_targets/crash_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

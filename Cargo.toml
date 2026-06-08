@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/rfs-core"]
+# `fuzz` is a cargo-fuzz package (nightly + Linux/macOS, libFuzzer); kept out of
+# the default build so `cargo build`/`test` stay stable + cross-platform.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
