@@ -31,6 +31,7 @@ pub mod digest;
 pub mod error;
 pub mod superblock;
 pub mod tree;
+pub mod volume;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
@@ -43,3 +44,4 @@ pub use digest::{Digest, Fast64, Hasher, SimdLevel};
 pub use error::{CorruptKind, StorageError};
 pub use superblock::Superblock;
 pub use tree::{BlockPtr, Internal, Key, Leaf, Node, Record, Tree, Txn};
+pub use volume::Volume;
