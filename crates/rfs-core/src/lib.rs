@@ -42,4 +42,4 @@ pub use device::{BlockDevice, Deallocate, PlacementHint, PlacementWrite, ZonedDe
 pub use digest::{Digest, Fast64, Hasher, SimdLevel};
 pub use error::{CorruptKind, StorageError};
 pub use superblock::Superblock;
-pub use tree::{BlockPtr, Internal, Key, Leaf, Node, Record};
+pub use tree::{BlockPtr, Internal, Key, Leaf, Node, Record, Tree, Txn};
