@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**46 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+**51 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
 bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
@@ -35,10 +35,11 @@ and the **ZIL** — `sync_insert`/`sync_delete` make writes durable immediately 
 a reserved intent-log ring, replayed on mount. fsync'd writes survive a crash;
 un-synced ones may not; a full ring forces a commit.
 
-M7 (started): the tree now stores **variable-length values** (`Value` trait;
-fixed keys, variable item data) — the foundation for inodes/dirents/extents of
-differing sizes. The VFS itself (FsKey schema, path resolution, file/dir ops) is
-Phase 2.
+M7 (in progress): variable-length values done; the **VFS directory namespace**
+is up — `Filesystem` over `FsKey (object_id, kind, k2)` with inode/dirent records,
+a tree **range scan**, and `mkdir`/`create`/`lookup`/`resolve`/`readdir`/
+`getattr`/`unlink`/`rmdir`. Collision-safe dirents (name-list buckets). Survives
+remount. Next: **file data via extents** (`read`/`write`, data-block lifecycle).
 
 M6 (started): a **byte-driven, model-checked crash-recovery driver**
 (`testkit::fuzz_crash_recovery`) shared by a deterministic in-crate simulation
@@ -137,8 +138,11 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] Phase 1: variable-length leaf values (`Value` trait; Btrfs "fixed key,
     variable item data"). Leaves pack length-prefixed values and split by bytes;
     keys + internal nodes stay fixed. Tree/txg/ZIL all converted.
-  - [ ] Phase 2: FsKey `(object_id, kind, k2)` + typed values (inode / dirent /
-    extent), path resolution, file read/write, directory ops; FS API on `Volume`.
+  - [x] Phase 2a: VFS namespace — `FsKey (object_id, kind, k2)`, inode/dirent
+    records, tree range scan, `Filesystem` (mkdir/create/lookup/resolve/readdir/
+    getattr/unlink/rmdir), collision-safe dirent buckets, remount-durable.
+  - [ ] Phase 2b: file data via extents (`read`/`write`, data-block lifecycle,
+    truncate), then per-op batching instead of commit-per-op.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine
@@ -181,7 +185,8 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/tree/ptr.rs      BlockPtr {addr, birth_txg, checksum}
   src/tree/node.rs     B+-tree node codec + write_node/read_node (verify-on-read)
   src/tree/btree.rs    Tree::insert/get — CoW walk, splits, MVCC; Txn context
-  src/volume.rs        Volume: format/open/insert/get/delete/commit/snapshot/delete_snapshot
+  src/volume.rs        Volume: format/open/insert/get/delete/range/commit/snapshot/sync
+  src/fs.rs            Filesystem: inodes, directories, paths (FsKey/FsValue)
   src/txg.rs           Txg: in-memory dirty-node shadow + coalesced serialize
   src/zil.rs           intent log: reserved ring, sync writes + mount replay
   src/snapshot.rs      self-checksummed snapshot directory (SnapEntry)

@@ -14,8 +14,11 @@
 //! The walk is iterative (descend collecting a path, rebuild bottom-up), which
 //! sidesteps recursive `async` and keeps allocation to the path depth.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::future::Future;
 use core::marker::PhantomData;
+use core::pin::Pin;
 
 use super::node::{
     Internal, Leaf, Node, leaf_fits, leaf_split_index, max_internal_keys, read_node, write_node,
@@ -133,6 +136,26 @@ impl<K: Key, V: Value> Tree<K, V> {
                     stack.push(*child);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Collects every `(key, value)` with `start <= key < end`, in ascending key
+    /// order, into `out`. Used by directory listing and other range queries.
+    ///
+    /// # Errors
+    /// Device or verification errors.
+    pub async fn range<D: BlockDevice>(
+        &self,
+        start: K,
+        end: K,
+        dev: &D,
+        pool: &mut BufferPool,
+        hasher: Hasher,
+        out: &mut Vec<(K, V)>,
+    ) -> Result<(), StorageError> {
+        if let Some(root) = self.root {
+            range_rec::<K, V, D>(root, &start, &end, dev, pool, hasher, out).await?;
         }
         Ok(())
     }
@@ -325,6 +348,53 @@ impl<K: Key, V: Value> Tree<K, V> {
         self.root = Some(child_ptr);
         Ok(true)
     }
+}
+
+type RangeFut<'f> = Pin<Box<dyn Future<Output = Result<(), StorageError>> + 'f>>;
+
+/// In-order range traversal over the on-disk tree, pruning subtrees that cannot
+/// overlap `[start, end)`.
+fn range_rec<'f, K: Key, V: Value, D: BlockDevice>(
+    ptr: BlockPtr,
+    start: &'f K,
+    end: &'f K,
+    dev: &'f D,
+    pool: &'f mut BufferPool,
+    hasher: Hasher,
+    out: &'f mut Vec<(K, V)>,
+) -> RangeFut<'f> {
+    Box::pin(async move {
+        match read_node::<K, V, D>(&ptr, dev, pool, hasher).await? {
+            Node::Leaf(leaf) => {
+                for (k, v) in leaf.entries {
+                    if k >= *start && k < *end {
+                        out.push((k, v));
+                    }
+                }
+            }
+            Node::Internal(node) => {
+                let n = node.keys.len();
+                for i in 0..=n {
+                    // child[i] covers [sep[i-1], sep[i]); visit if it overlaps.
+                    let below_end = i == 0 || node.keys[i - 1] < *end;
+                    let above_start = i == n || *start < node.keys[i];
+                    if below_end && above_start {
+                        range_rec::<K, V, D>(
+                            node.children[i],
+                            start,
+                            end,
+                            dev,
+                            &mut *pool,
+                            hasher,
+                            &mut *out,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Writes a node through the transaction: copy-on-write (new block, never
