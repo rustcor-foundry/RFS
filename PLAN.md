@@ -7,17 +7,18 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**33 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**35 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
-Placement caps, Digest+SIMD dispatch), M3 increment 1 (BlockPtr + B+-tree node
-codec + `write_node`/`read_node` with parent-checksum verify-on-read), and M3
-increment 2 (CoW `Tree::insert`/`get` walk with node splits, height growth, and
-MVCC — old root survives as a snapshot; `Txn` write context).
+Placement caps, Digest+SIMD dispatch), M3 inc.1 (BlockPtr + B+-tree node codec +
+verify-on-read), M3 inc.2 (CoW `Tree::insert`/`get` walk, splits, height growth,
+MVCC), and M3 inc.3 (`Volume`: root publish through the superblock commit —
+**first whole-stack crash-atomic transaction**: `insert → commit → reopen → get`
+survives, and a torn commit rolls back to the prior committed tree).
 
-In progress: M3 — root publish through the superblock commit; then birth-time
-reclamation + snapshot directory.
+In progress: M3 — birth-time reclamation + snapshot directory; allocator
+persistence / mark-and-sweep so a remounted volume is writable.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -73,7 +74,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     parent-checksum verify-on-read (corruption → `BadChecksum`).
   - [x] `Tree::insert`/`get` — iterative CoW walk: leaf upsert, node splits,
     height growth, MVCC (old root intact). `Txn` write context.
-  - [ ] Root publish via superblock commit (the first whole-stack transaction).
+  - [x] `Volume` — root publish via superblock commit; `insert → commit →
+    reopen → get` round-trip; torn-commit rolls back to prior tree.
+  - [ ] Allocator persistence / mark-and-sweep recovery (write after remount).
   - [ ] Birth-time/dead-list reclamation; snapshot directory.
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
   nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
@@ -124,6 +127,7 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/tree/ptr.rs      BlockPtr {addr, birth_txg, checksum}
   src/tree/node.rs     B+-tree node codec + write_node/read_node (verify-on-read)
   src/tree/btree.rs    Tree::insert/get — CoW walk, splits, MVCC; Txn context
+  src/volume.rs        Volume: format/open/insert/get/commit (whole-stack txn)
   src/error.rs         StorageError incl. CapabilityRevoked / DeviceRemoved
   src/testkit.rs       MemDevice (crash injection) + block_on  [feature: testkit]
 ```
