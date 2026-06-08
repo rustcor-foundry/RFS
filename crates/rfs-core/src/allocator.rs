@@ -92,6 +92,19 @@ pub trait Allocator {
     /// Marks the durability barrier as reached: segments emptied since the last
     /// commit become reusable.
     fn commit(&mut self);
+
+    /// Marks `block` as live during mount-time recovery (mark-and-sweep). Call
+    /// once per reachable block, before any [`alloc`](Allocator::alloc) /
+    /// [`free`](Allocator::free), then [`finish_rebuild`](Allocator::finish_rebuild).
+    ///
+    /// # Errors
+    /// [`AllocError::OutOfRange`] for an out-of-device or reserved block.
+    fn mark_live(&mut self, block: u64) -> Result<(), AllocError>;
+
+    /// Finalizes recovery: any segment holding a live block becomes closed
+    /// (immutable until it empties); the rest become free and reusable.
+    /// Unreferenced (garbage) blocks in fully-dead segments are reclaimed.
+    fn finish_rebuild(&mut self);
 }
 
 /// Static description of how the device is divided into segments.
@@ -326,6 +339,42 @@ impl Allocator for SegmentAllocator {
                 self.free_segments += 1;
             }
         }
+    }
+
+    fn mark_live(&mut self, block: u64) -> Result<(), AllocError> {
+        let seg = self.seg_of(block).ok_or(AllocError::OutOfRange)?;
+        if self.segments[seg as usize].state == SegState::Reserved {
+            return Err(AllocError::OutOfRange);
+        }
+        let idx = usize::try_from(block).map_err(|_| AllocError::OutOfRange)?;
+        if idx >= self.bitmap_len() {
+            return Err(AllocError::OutOfRange);
+        }
+        if !self.bitmap.get(idx) {
+            self.bitmap.set(idx);
+            self.segments[seg as usize].valid += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_rebuild(&mut self) {
+        let bps = self.geom.blocks_per_segment;
+        self.active = [None; SegKind::COUNT];
+        let mut free = 0u32;
+        for seg in &mut self.segments {
+            if seg.state == SegState::Reserved {
+                continue;
+            }
+            if seg.valid > 0 {
+                seg.state = SegState::Closed;
+                seg.write_ptr = bps;
+            } else {
+                seg.state = SegState::Free;
+                seg.write_ptr = 0;
+                free += 1;
+            }
+        }
+        self.free_segments = free;
     }
 }
 
