@@ -7,14 +7,16 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**29 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**33 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
-Placement caps, Digest+SIMD dispatch), and M3 increment 1 (BlockPtr + B+-tree
-node codec + `write_node`/`read_node` with parent-checksum verify-on-read).
+Placement caps, Digest+SIMD dispatch), M3 increment 1 (BlockPtr + B+-tree node
+codec + `write_node`/`read_node` with parent-checksum verify-on-read), and M3
+increment 2 (CoW `Tree::insert`/`get` walk with node splits, height growth, and
+MVCC — old root survives as a snapshot; `Txn` write context).
 
-In progress: M3 — CoW insert/split/lookup walk and root publish; then birth-time
+In progress: M3 — root publish through the superblock commit; then birth-time
 reclamation + snapshot directory.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
@@ -69,7 +71,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] `Record`/`Key` traits; B+-tree leaf/internal node codec + capacities.
   - [x] `write_node`/`read_node` — CoW write (leaf→Data, internal→Meta) +
     parent-checksum verify-on-read (corruption → `BadChecksum`).
-  - [ ] CoW insert / split / lookup walk; root publish via superblock commit.
+  - [x] `Tree::insert`/`get` — iterative CoW walk: leaf upsert, node splits,
+    height growth, MVCC (old root intact). `Txn` write context.
+  - [ ] Root publish via superblock commit (the first whole-stack transaction).
   - [ ] Birth-time/dead-list reclamation; snapshot directory.
 - [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
   nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
@@ -119,6 +123,7 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/checksum.rs      fletcher64 + DigestMode
   src/tree/ptr.rs      BlockPtr {addr, birth_txg, checksum}
   src/tree/node.rs     B+-tree node codec + write_node/read_node (verify-on-read)
+  src/tree/btree.rs    Tree::insert/get — CoW walk, splits, MVCC; Txn context
   src/error.rs         StorageError incl. CapabilityRevoked / DeviceRemoved
   src/testkit.rs       MemDevice (crash injection) + block_on  [feature: testkit]
 ```

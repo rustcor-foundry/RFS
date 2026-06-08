@@ -8,9 +8,11 @@
 //! Keys and values are fixed-size via the [`Record`] trait; variable-length
 //! records (e.g. inline file tails) are a later extension.
 
+mod btree;
 mod node;
 mod ptr;
 
+pub use btree::{Tree, Txn};
 pub use node::{Internal, Leaf, Node, max_internal_keys, max_leaf_entries, read_node, write_node};
 pub use ptr::{BlockPtr, MAX_CKSUM, PTR_PREFIX};
 
