@@ -33,6 +33,7 @@ use crate::snapshot::{self, SnapEntry};
 use crate::superblock::{self, Superblock};
 use crate::tree::{BlockPtr, Key, Record, Tree};
 use crate::txg::Txg;
+use crate::zil::{self, ZIL_CAPACITY, ZilRecord};
 
 /// A mounted RFS volume parameterized by key/value record types and the
 /// allocator/device implementations.
@@ -49,6 +50,8 @@ pub struct Volume<K, V, A, D> {
     sb: Superblock,
     txg: Txg<K, V>,
     snaps: Vec<SnapEntry>,
+    /// Next ZIL sequence number to write (records pending since last commit).
+    zil_seq: u64,
 }
 
 impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
@@ -69,6 +72,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             sb,
             txg: Txg::begin(None),
             snaps: Vec::new(),
+            zil_seq: 0,
         })
     }
 
@@ -115,14 +119,39 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         }
         alloc.finish_rebuild();
 
+        // Replay the intent log on top of the committed root: re-apply any
+        // fsync'd ops recorded since the last commit (the ZIL ring is reserved,
+        // so it is untouched by mark-and-sweep above).
+        let mut txg = Txg::begin(root);
+        let mut zil_seq = 0u64;
+        while zil_seq < ZIL_CAPACITY {
+            match zil::read::<K, V, D>(zil_seq, sb.txg, &dev, &mut pool).await? {
+                None => break,
+                Some(records) => {
+                    for record in records {
+                        match record {
+                            ZilRecord::Insert(k, v) => {
+                                txg.insert(k, v, &dev, &mut pool, hasher).await?;
+                            }
+                            ZilRecord::Delete(k) => {
+                                txg.delete(&k, &dev, &mut pool, hasher).await?;
+                            }
+                        }
+                    }
+                    zil_seq += 1;
+                }
+            }
+        }
+
         Ok(Self {
             dev,
             alloc,
             pool,
             hasher,
             sb,
-            txg: Txg::begin(root),
+            txg,
             snaps,
+            zil_seq,
         })
     }
 
@@ -169,6 +198,50 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.txg.delete(key, &self.dev, &mut self.pool, self.hasher).await
     }
 
+    /// Inserts `key => val` and makes it durable immediately via the intent log
+    /// (an `fsync`-style write), without forcing a full commit. Survives a crash;
+    /// is folded into the next commit.
+    ///
+    /// # Errors
+    /// Allocation, device, or verification errors.
+    pub async fn sync_insert(&mut self, key: K, val: V) -> Result<(), StorageError> {
+        if self.zil_seq >= ZIL_CAPACITY {
+            self.commit().await?; // ring full: drain it into a real txg (resets seq)
+        }
+        self.txg.insert(key, val, &self.dev, &mut self.pool, self.hasher).await?;
+        zil::append(
+            &[ZilRecord::Insert(key, val)],
+            self.sb.txg,
+            self.zil_seq,
+            &self.dev,
+            &mut self.pool,
+        )
+        .await?;
+        self.zil_seq += 1;
+        Ok(())
+    }
+
+    /// Removes `key` durably via the intent log. Returns whether it was present.
+    ///
+    /// # Errors
+    /// Allocation, device, or verification errors.
+    pub async fn sync_delete(&mut self, key: &K) -> Result<bool, StorageError> {
+        if self.zil_seq >= ZIL_CAPACITY {
+            self.commit().await?;
+        }
+        let removed = self.txg.delete(key, &self.dev, &mut self.pool, self.hasher).await?;
+        zil::append(
+            &[ZilRecord::<K, V>::Delete(*key)],
+            self.sb.txg,
+            self.zil_seq,
+            &self.dev,
+            &mut self.pool,
+        )
+        .await?;
+        self.zil_seq += 1;
+        Ok(removed)
+    }
+
     /// Publishes the open transaction: stamps the tree root into a new superblock
     /// and writes it to the ring (the durability barrier). On success advances
     /// the txg and drains the allocator's deferred frees.
@@ -197,6 +270,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         superblock::commit(&self.dev, &sb).await?;
         self.sb = sb;
         self.txg = Txg::begin(new_root);
+        self.zil_seq = 0; // ZIL records are now folded into the committed tree
         self.free_superseded(&freed, youngest)?;
         self.alloc.commit();
         Ok(())
@@ -250,6 +324,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.sb = sb;
         self.snaps = snaps;
         self.txg = Txg::begin(new_root);
+        self.zil_seq = 0;
         self.free_superseded(&freed, youngest)?;
         self.alloc.commit();
         Ok(id)
@@ -304,6 +379,7 @@ impl<K: Key, V: Record, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.sb = sb;
         self.snaps = snaps;
         self.txg = Txg::begin(new_root);
+        self.zil_seq = 0;
 
         self.gc().await
     }
@@ -667,6 +743,53 @@ mod tests {
         let writes = vol.device().write_count() - before;
         assert!(writes <= 4, "expected coalesced commit, got {writes} writes");
         assert_eq!(block_on(vol.get(&7)).unwrap(), Some(499));
+    }
+
+    #[test]
+    fn zil_recovers_synced_writes_but_not_unsynced() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+
+        // A non-sync insert (only in the open txg) and a sync insert (also in the
+        // ZIL), with NO commit — then simulate a crash by remounting the media.
+        block_on(vol.insert(1, 10)).unwrap();
+        block_on(vol.sync_insert(2, 20)).unwrap();
+
+        let crashed = vol.device().snapshot();
+        let mut recovered: Vol = block_on(Volume::open(crashed, fresh_alloc())).unwrap();
+        assert_eq!(
+            block_on(recovered.get(&2)).unwrap(),
+            Some(20),
+            "fsync'd write must survive the crash"
+        );
+        assert_eq!(
+            block_on(recovered.get(&1)).unwrap(),
+            None,
+            "un-synced write may be lost"
+        );
+
+        // The replayed op is durable: committing then remounting keeps it.
+        block_on(recovered.commit()).unwrap();
+        let media2 = recovered.device().snapshot();
+        let mut again: Vol = block_on(Volume::open(media2, fresh_alloc())).unwrap();
+        assert_eq!(block_on(again.get(&2)).unwrap(), Some(20));
+    }
+
+    #[test]
+    fn zil_ring_full_forces_commit_and_keeps_data() {
+        let dev = MemDevice::new(BS, BLOCKS);
+        let mut vol: Vol =
+            block_on(Volume::format(dev, fresh_alloc(), DigestMode::Fast64)).unwrap();
+        // More sync writes than the ring holds: forces commits along the way.
+        for k in 0..100u64 {
+            block_on(vol.sync_insert(k, k + 1)).unwrap();
+        }
+        let media = vol.device().snapshot();
+        let mut recovered: Vol = block_on(Volume::open(media, fresh_alloc())).unwrap();
+        for k in 0..100u64 {
+            assert_eq!(block_on(recovered.get(&k)).unwrap(), Some(k + 1), "synced {k}");
+        }
     }
 
     #[test]
