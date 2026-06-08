@@ -1,0 +1,13 @@
+# FUSE adapter: mounts an RFS Filesystem as a real Linux directory.
+# Linux-only (libfuse); kept out of the workspace so the stable cross-platform
+# build/test of rfs-core is unaffected.
+[package]
+name = "rfs-fuse"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rfs-core = { path = "../crates/rfs-core" }
+fuser = "0.14"
+libc = "0.2"
