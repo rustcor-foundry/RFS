@@ -7,7 +7,7 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**42 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
+**43 tests passing · clippy-pedantic clean · bare-metal RISC-V build green.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -28,9 +28,14 @@ its `birth_txg` shows a snapshot pins it) and **`Volume::delete_snapshot`** with
 reclamation (removes the entry, commits, then an online mark-and-sweep frees the
 blocks the snapshot alone pinned).
 
-In progress: M3 — per-snapshot dead-lists to make delete/free incremental (vs.
-the current full sweep); persisted space map to avoid the full-tree scan on
-mount. Then M4 (txg + ZIL).
+M4 (started): **txg batching with coalescing** — `Volume` writes accumulate in an
+in-memory `Txg` (dirty-node shadow); `commit`/`snapshot` serialize each touched
+node once. 500 updates to one key → ≤4 device writes at commit (was ~hundreds).
+Birth-gated freeing of superseded blocks moved to commit.
+
+In progress: M4 — the ZIL (intent log for `fsync` latency); then persisted
+per-snapshot dead-lists (now that there's a txg to batch their appends), and a
+persisted space map to avoid the full-tree scan on mount.
 
 Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
 
@@ -100,9 +105,11 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [ ] Structural compaction on delete (merge underfull nodes, shrink height).
   - [ ] Per-snapshot dead-lists (incremental delete/free vs. full sweep).
   - [ ] Persisted space map (avoid full-tree scan on mount).
-- [ ] **M4 — txg transaction layer + ZIL**: dirty-node cache → coalesce → write
-  nodes → publish root via M1. Intent log for fsync (replay on mount). Power-cut
-  fuzzing through the whole stack, including the ZIL tail.
+- [~] **M4 — txg transaction layer + ZIL**:
+  - [x] In-memory dirty-node shadow (`txg.rs`) with coalescing: ops buffer in
+    RAM, `serialize` writes each touched node once, birth-gated free at commit.
+  - [ ] ZIL: intent log for `fsync` between commits (replay on mount).
+  - [ ] Power-cut fuzzing through the whole stack, including the ZIL tail.
 - [ ] **M5 — `rfs-feox` adapter**: bridge `feox-nvme` async queues to
   `BlockDevice`, capability-revocation aware.
 - [ ] **M6 — FUSE testbed** (desktop) + `cargo fuzz` campaign.
@@ -149,7 +156,8 @@ crates/rfs-core/   #![no_std] engine — device seam, superblock, (later) alloca
   src/tree/ptr.rs      BlockPtr {addr, birth_txg, checksum}
   src/tree/node.rs     B+-tree node codec + write_node/read_node (verify-on-read)
   src/tree/btree.rs    Tree::insert/get — CoW walk, splits, MVCC; Txn context
-  src/volume.rs        Volume: format/open/insert/get/commit/snapshot (whole-stack txn)
+  src/volume.rs        Volume: format/open/insert/get/delete/commit/snapshot/delete_snapshot
+  src/txg.rs           Txg: in-memory dirty-node shadow + coalesced serialize
   src/snapshot.rs      self-checksummed snapshot directory (SnapEntry)
   src/error.rs         StorageError incl. CapabilityRevoked / DeviceRemoved
   src/testkit.rs       MemDevice (crash injection) + block_on  [feature: testkit]

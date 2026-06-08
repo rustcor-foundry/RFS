@@ -32,6 +32,7 @@ pub mod error;
 pub mod snapshot;
 pub mod superblock;
 pub mod tree;
+pub mod txg;
 pub mod volume;
 
 #[cfg(any(test, feature = "testkit"))]

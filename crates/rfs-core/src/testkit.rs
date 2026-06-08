@@ -45,6 +45,8 @@ pub struct MemDevice {
     write_budget: Cell<Option<u64>>,
     /// Total blocks deallocated (TRIM) — lets tests observe the capability.
     trimmed: Cell<u64>,
+    /// Count of `write_block` calls — lets tests observe write amplification.
+    writes: Cell<u64>,
 }
 
 impl MemDevice {
@@ -63,6 +65,7 @@ impl MemDevice {
             media: RefCell::new(alloc::vec![0u8; total]),
             write_budget: Cell::new(None),
             trimmed: Cell::new(0),
+            writes: Cell::new(0),
         }
     }
 
@@ -70,6 +73,12 @@ impl MemDevice {
     #[must_use]
     pub fn trimmed_blocks(&self) -> u64 {
         self.trimmed.get()
+    }
+
+    /// Total number of `write_block` calls so far (write-amplification probe).
+    #[must_use]
+    pub fn write_count(&self) -> u64 {
+        self.writes.get()
     }
 
     /// Sets a write budget in bytes; `None` clears the limit (writes succeed).
@@ -89,6 +98,7 @@ impl MemDevice {
             media: RefCell::new(self.media.borrow().clone()),
             write_budget: Cell::new(None),
             trimmed: Cell::new(self.trimmed.get()),
+            writes: Cell::new(self.writes.get()),
         }
     }
 
@@ -123,6 +133,7 @@ impl BlockDevice for MemDevice {
         if buf.len() != self.block_size {
             return Err(StorageError::BufferSize);
         }
+        self.writes.set(self.writes.get() + 1);
         let (start, _end) = self.span(lba)?;
 
         // How many bytes are we allowed to actually commit before "power loss"?
