@@ -145,7 +145,9 @@ impl BlockDevice for MemDevice {
         let writable = match self.write_budget.get() {
             None => self.block_size,
             Some(budget) => {
-                let allowed = usize::try_from(budget).unwrap_or(usize::MAX).min(self.block_size);
+                let allowed = usize::try_from(budget)
+                    .unwrap_or(usize::MAX)
+                    .min(self.block_size);
                 // Consume the budget; a short write trips the failure path below.
                 self.write_budget
                     .set(Some(budget.saturating_sub(allowed as u64)));
@@ -173,7 +175,9 @@ impl BlockDevice for MemDevice {
 
 impl Deallocate for MemDevice {
     async fn deallocate(&self, start_lba: u64, count: u64) -> Result<(), StorageError> {
-        let end = start_lba.checked_add(count).ok_or(StorageError::OutOfBounds)?;
+        let end = start_lba
+            .checked_add(count)
+            .ok_or(StorageError::OutOfBounds)?;
         if end > self.block_count {
             return Err(StorageError::OutOfBounds);
         }
@@ -238,8 +242,7 @@ fn fuzz_drain(
 /// On any divergence from the durability model (that *is* the test).
 pub fn fuzz_crash_recovery(data: &[u8]) {
     let dev = MemDevice::new(FUZZ_BS, FUZZ_BLOCKS);
-    let mut vol: FuzzVol =
-        block_on(Volume::format(dev, fuzz_alloc(), DigestMode::Fast64)).unwrap();
+    let mut vol: FuzzVol = block_on(Volume::format(dev, fuzz_alloc(), DigestMode::Fast64)).unwrap();
 
     let mut working: BTreeMap<u64, u64> = BTreeMap::new();
     let mut durable: BTreeMap<u64, u64> = BTreeMap::new();
@@ -410,7 +413,10 @@ mod tests {
             if recovered.txg == next.txg {
                 assert_eq!(recovered.root_addr, 999, "budget {budget}: full commit");
             } else {
-                assert_eq!(recovered.root_addr, good.root_addr, "budget {budget}: rollback");
+                assert_eq!(
+                    recovered.root_addr, good.root_addr,
+                    "budget {budget}: rollback"
+                );
             }
         }
     }

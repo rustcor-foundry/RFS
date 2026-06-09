@@ -182,7 +182,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Allocation, device, or verification errors.
     pub async fn insert(&mut self, key: K, val: V) -> Result<(), StorageError> {
-        self.txg.insert(key, val, &self.dev, &mut self.pool, self.hasher).await
+        self.txg
+            .insert(key, val, &self.dev, &mut self.pool, self.hasher)
+            .await
     }
 
     /// Looks up `key` in the current (committed + open) tree.
@@ -190,7 +192,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Device or verification errors.
     pub async fn get(&mut self, key: &K) -> Result<Option<V>, StorageError> {
-        self.txg.get(key, &self.dev, &mut self.pool, self.hasher).await
+        self.txg
+            .get(key, &self.dev, &mut self.pool, self.hasher)
+            .await
     }
 
     /// Collects `[start, end)` from the current (committed + open) tree into
@@ -204,7 +208,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         end: K,
         out: &mut Vec<(K, V)>,
     ) -> Result<(), StorageError> {
-        self.txg.range(start, end, &self.dev, &mut self.pool, self.hasher, out).await
+        self.txg
+            .range(start, end, &self.dev, &mut self.pool, self.hasher, out)
+            .await
     }
 
     /// The device block size — the unit of file-data extents.
@@ -269,7 +275,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
     /// # Errors
     /// Allocation, device, or verification errors.
     pub async fn delete(&mut self, key: &K) -> Result<bool, StorageError> {
-        self.txg.delete(key, &self.dev, &mut self.pool, self.hasher).await
+        self.txg
+            .delete(key, &self.dev, &mut self.pool, self.hasher)
+            .await
     }
 
     /// Inserts `key => val` and makes it durable immediately via the intent log
@@ -282,7 +290,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         if self.zil_seq >= ZIL_CAPACITY {
             self.commit().await?; // ring full: drain it into a real txg (resets seq)
         }
-        self.txg.insert(key, val.clone(), &self.dev, &mut self.pool, self.hasher).await?;
+        self.txg
+            .insert(key, val.clone(), &self.dev, &mut self.pool, self.hasher)
+            .await?;
         zil::append(
             &[ZilRecord::Insert(key, val)],
             self.sb.txg,
@@ -303,7 +313,10 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         if self.zil_seq >= ZIL_CAPACITY {
             self.commit().await?;
         }
-        let removed = self.txg.delete(key, &self.dev, &mut self.pool, self.hasher).await?;
+        let removed = self
+            .txg
+            .delete(key, &self.dev, &mut self.pool, self.hasher)
+            .await?;
         zil::append(
             &[ZilRecord::<K, V>::Delete(*key)],
             self.sb.txg,
@@ -332,7 +345,13 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         // Serialize the dirty shadow (each touched node written once).
         let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
         let (new_root, freed) = working
-            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .serialize(
+                next,
+                &mut self.alloc,
+                &self.dev,
+                &mut self.pool,
+                self.hasher,
+            )
             .await?;
 
         let mut sb = self.sb;
@@ -379,7 +398,13 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         let cr = self.committed_root();
         let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
         let (new_root, freed) = working
-            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .serialize(
+                next,
+                &mut self.alloc,
+                &self.dev,
+                &mut self.pool,
+                self.hasher,
+            )
             .await?;
 
         let id = self.snaps.iter().map(|s| s.id).max().map_or(0, |m| m + 1);
@@ -389,7 +414,8 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
             txg: next,
             root: new_root.unwrap_or(BlockPtr::NULL),
         });
-        let snaplist_root = snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?;
+        let snaplist_root =
+            snapshot::write(&snaps, &mut self.alloc, &self.dev, &mut self.pool).await?;
 
         let mut sb = self.sb;
         sb.txg = next;
@@ -438,7 +464,13 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         let cr = self.committed_root();
         let working = core::mem::replace(&mut self.txg, Txg::begin(cr));
         let (new_root, _freed) = working
-            .serialize(next, &mut self.alloc, &self.dev, &mut self.pool, self.hasher)
+            .serialize(
+                next,
+                &mut self.alloc,
+                &self.dev,
+                &mut self.pool,
+                self.hasher,
+            )
             .await?;
 
         let mut snaps = self.snaps.clone();
@@ -530,7 +562,9 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         if root.is_null() {
             return Ok(None);
         }
-        Tree::<K, V>::at(root).get(key, &self.dev, &mut self.pool, self.hasher).await
+        Tree::<K, V>::at(root)
+            .get(key, &self.dev, &mut self.pool, self.hasher)
+            .await
     }
 
     /// Enumerates every block referenced by snapshot `id` (for replication,
@@ -607,7 +641,11 @@ mod tests {
         for k in 0..300u64 {
             block_on(vol.insert(k, k.wrapping_mul(7))).unwrap();
         }
-        assert_eq!(vol.committed_txg(), 1, "uncommitted work does not advance txg");
+        assert_eq!(
+            vol.committed_txg(),
+            1,
+            "uncommitted work does not advance txg"
+        );
         block_on(vol.commit()).unwrap();
         assert_eq!(vol.committed_txg(), 2);
 
@@ -676,7 +714,11 @@ mod tests {
         block_on(vol.commit()).unwrap();
 
         for k in 0..50u64 {
-            assert_eq!(block_on(vol.get(&k)).unwrap(), Some(k + 1000), "live updated");
+            assert_eq!(
+                block_on(vol.get(&k)).unwrap(),
+                Some(k + 1000),
+                "live updated"
+            );
             assert_eq!(
                 block_on(vol.get_in_snapshot(s0, &k)).unwrap(),
                 Some(k),
@@ -745,7 +787,10 @@ mod tests {
             .copied()
             .filter(|b| !live_blocks.contains(b))
             .collect();
-        assert!(!unique.is_empty(), "overwrites should orphan snapshot-only blocks");
+        assert!(
+            !unique.is_empty(),
+            "overwrites should orphan snapshot-only blocks"
+        );
         // Pre-delete: snapshot-only blocks are still pinned (allocated).
         for b in &unique {
             assert!(vol.allocator().is_allocated(*b));
@@ -757,10 +802,16 @@ mod tests {
 
         // Snapshot-only blocks reclaimed; live blocks retained.
         for b in &unique {
-            assert!(!vol.allocator().is_allocated(*b), "block {b} should be reclaimed");
+            assert!(
+                !vol.allocator().is_allocated(*b),
+                "block {b} should be reclaimed"
+            );
         }
         for b in &live_blocks {
-            assert!(vol.allocator().is_allocated(*b), "live block {b} must remain");
+            assert!(
+                vol.allocator().is_allocated(*b),
+                "live block {b} must remain"
+            );
         }
         for k in 0..50u64 {
             assert_eq!(block_on(vol.get(&k)).unwrap(), Some(k + 1000));
@@ -820,7 +871,10 @@ mod tests {
         // Commit writes the single dirty leaf once + one superblock block — a
         // small constant, NOT ~500. (Without coalescing this would be hundreds.)
         let writes = vol.device().write_count() - before;
-        assert!(writes <= 4, "expected coalesced commit, got {writes} writes");
+        assert!(
+            writes <= 4,
+            "expected coalesced commit, got {writes} writes"
+        );
         assert_eq!(block_on(vol.get(&7)).unwrap(), Some(499));
     }
 
@@ -867,7 +921,11 @@ mod tests {
         let media = vol.device().snapshot();
         let mut recovered: Vol = block_on(Volume::open(media, fresh_alloc())).unwrap();
         for k in 0..100u64 {
-            assert_eq!(block_on(recovered.get(&k)).unwrap(), Some(k + 1), "synced {k}");
+            assert_eq!(
+                block_on(recovered.get(&k)).unwrap(),
+                Some(k + 1),
+                "synced {k}"
+            );
         }
     }
 
@@ -886,14 +944,21 @@ mod tests {
         // the superblock write of the txg-3 commit (power cut at publish time).
         block_on(vol.insert(2, 222)).unwrap();
         vol.device().set_write_budget(Some(10));
-        assert!(block_on(vol.commit()).is_err(), "torn superblock write must error");
+        assert!(
+            block_on(vol.commit()).is_err(),
+            "torn superblock write must error"
+        );
         assert_eq!(vol.committed_txg(), 2, "failed commit does not advance txg");
 
         // Recover from the crashed media (read-only mount): prior committed state.
         let crashed = vol.device().snapshot();
         let mut recovered: Vol = block_on(Volume::open(crashed, fresh_alloc())).unwrap();
         assert_eq!(recovered.committed_txg(), 2, "rolled back to last good txg");
-        assert_eq!(block_on(recovered.get(&1)).unwrap(), Some(111), "committed key survives");
+        assert_eq!(
+            block_on(recovered.get(&1)).unwrap(),
+            Some(111),
+            "committed key survives"
+        );
         assert_eq!(
             block_on(recovered.get(&2)).unwrap(),
             None,

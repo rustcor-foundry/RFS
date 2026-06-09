@@ -115,6 +115,12 @@ mod tests {
     #[test]
     fn null_pointer() {
         assert!(BlockPtr::NULL.is_null());
-        assert!(!BlockPtr { addr: 1, ..BlockPtr::NULL }.is_null());
+        assert!(
+            !BlockPtr {
+                addr: 1,
+                ..BlockPtr::NULL
+            }
+            .is_null()
+        );
     }
 }

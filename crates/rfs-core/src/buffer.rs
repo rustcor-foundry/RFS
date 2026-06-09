@@ -193,7 +193,11 @@ mod tests {
     fn carries_region_handle() {
         let mut buf = AlignedBuf::new(512, 64);
         assert_eq!(buf.region(), None);
-        let key = RegionKey { lkey: 7, rkey: 9, remote_addr: 0xdead_beef };
+        let key = RegionKey {
+            lkey: 7,
+            rkey: 9,
+            remote_addr: 0xdead_beef,
+        };
         buf.set_region(key);
         assert_eq!(buf.region(), Some(key));
     }

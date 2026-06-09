@@ -44,11 +44,7 @@ pub trait BlockDevice {
     /// establish a durability barrier.
     ///
     /// [`flush`]: BlockDevice::flush
-    fn write_block(
-        &self,
-        lba: u64,
-        buf: &[u8],
-    ) -> impl Future<Output = Result<(), StorageError>>;
+    fn write_block(&self, lba: u64, buf: &[u8]) -> impl Future<Output = Result<(), StorageError>>;
 
     /// Establishes a durability barrier: all prior successful writes are on
     /// stable media once this resolves `Ok`.
