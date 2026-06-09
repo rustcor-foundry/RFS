@@ -3,7 +3,7 @@
 # build/test of rfs-core is unaffected.
 [package]
 name = "rfs-fuse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 description = "Mount an RFS copy-on-write filesystem image via FUSE"
