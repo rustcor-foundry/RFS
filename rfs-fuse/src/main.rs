@@ -261,6 +261,27 @@ impl FuseFs for Adapter {
         }
     }
 
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        match block_on(self.fs.rename(
+            parent,
+            name.as_bytes(),
+            newparent,
+            newname.as_bytes(),
+        )) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
     fn readdir(
         &mut self,
         _req: &Request,

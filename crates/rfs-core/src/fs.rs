@@ -475,18 +475,106 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         Ok(out)
     }
 
-    /// Removes a regular file `name` from `parent` (drops its inode at nlink 0).
+    /// Frees every data extent of `ino` (and its data blocks). Does not commit.
+    async fn free_file_data(&mut self, ino: u64) -> Result<(), StorageError> {
+        let mut exts = Vec::new();
+        self.vol
+            .range(
+                FsKey::extent(ino, 0),
+                FsKey::new(ino, KIND_EXTENT + 1, 0),
+                &mut exts,
+            )
+            .await?;
+        for (key, value) in exts {
+            if let FsValue::Extent(ptr) = value {
+                self.vol.free_data_block(ptr);
+            }
+            self.vol.delete(&key).await?;
+        }
+        Ok(())
+    }
+
+    /// Drops a link to `child`, freeing the inode (and a file's data) at nlink 0.
+    /// Does not commit.
+    async fn drop_link(&mut self, child: u64) -> Result<(), StorageError> {
+        let mut inode = self.read_inode(child).await?;
+        inode.nlink = inode.nlink.saturating_sub(1);
+        if inode.nlink == 0 {
+            if !inode.is_dir() {
+                self.free_file_data(child).await?;
+            }
+            self.vol.delete(&FsKey::inode(child)).await?;
+        } else {
+            self.write_inode(child, inode).await?;
+        }
+        Ok(())
+    }
+
+    /// Adjusts an inode's link count by `delta` (clamped at 0). Does not commit.
+    async fn adjust_nlink(&mut self, ino: u64, delta: i64) -> Result<(), StorageError> {
+        let mut inode = self.read_inode(ino).await?;
+        inode.nlink = u32::try_from(i64::from(inode.nlink) + delta).unwrap_or(0);
+        self.write_inode(ino, inode).await
+    }
+
+    /// Removes a regular file `name` from `parent`, freeing its data at nlink 0.
     ///
     /// # Errors
     /// [`StorageError::NotFound`] or I/O.
     pub async fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<(), StorageError> {
         let child = self.unlink_entry(parent, name).await?;
-        let mut inode = self.read_inode(child).await?;
-        inode.nlink = inode.nlink.saturating_sub(1);
-        if inode.nlink == 0 {
-            self.vol.delete(&FsKey::inode(child)).await?;
-        } else {
-            self.write_inode(child, inode).await?;
+        self.drop_link(child).await?;
+        self.vol.commit().await
+    }
+
+    /// Renames `(old_parent, old_name)` to `(new_parent, new_name)`, replacing an
+    /// existing destination (empty dir or file). One atomic transaction.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`], [`StorageError::NotADirectory`] (type mismatch
+    /// with the destination), [`StorageError::NotEmpty`], or I/O.
+    pub async fn rename(
+        &mut self,
+        old_parent: u64,
+        old_name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> Result<(), StorageError> {
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+        let src = self
+            .lookup(old_parent, old_name)
+            .await?
+            .ok_or(StorageError::NotFound)?;
+        let src_is_dir = self.read_inode(src).await?.is_dir();
+
+        // Replace an existing destination, if any.
+        if let Some(dst) = self.lookup(new_parent, new_name).await? {
+            let dst_is_dir = self.read_inode(dst).await?.is_dir();
+            if dst_is_dir != src_is_dir {
+                return Err(StorageError::NotADirectory);
+            }
+            if dst_is_dir && !self.readdir(dst).await?.is_empty() {
+                return Err(StorageError::NotEmpty);
+            }
+            self.unlink_entry(new_parent, new_name).await?;
+            if dst_is_dir {
+                self.vol.delete(&FsKey::inode(dst)).await?;
+                self.adjust_nlink(new_parent, -1).await?; // dest dir's ".." gone
+            } else {
+                self.drop_link(dst).await?;
+            }
+        }
+
+        // Move the source entry.
+        self.unlink_entry(old_parent, old_name).await?;
+        self.link(new_parent, new_name, src).await?;
+
+        // A directory moving between parents re-homes its ".." link.
+        if src_is_dir && old_parent != new_parent {
+            self.adjust_nlink(old_parent, -1).await?;
+            self.adjust_nlink(new_parent, 1).await?;
         }
         self.vol.commit().await
     }
@@ -781,6 +869,73 @@ mod tests {
         // Grow back: the gap is a hole (zeros), not the old data.
         block_on(fs.truncate(f, 10)).unwrap();
         assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rename_moves_files_and_dirs() {
+        let mut fs = fresh();
+        let a = block_on(fs.mkdir(ROOT_INO, b"a", 0o755)).unwrap();
+        let b = block_on(fs.mkdir(ROOT_INO, b"b", 0o755)).unwrap();
+        let f = block_on(fs.create(a, b"f", 0o644)).unwrap();
+        block_on(fs.write(f, 0, b"payload")).unwrap();
+
+        // Move file a/f -> b/g, content preserved, old gone.
+        block_on(fs.rename(a, b"f", b, b"g")).unwrap();
+        assert_eq!(block_on(fs.lookup(a, b"f")).unwrap(), None);
+        let g = block_on(fs.lookup(b, b"g")).unwrap().unwrap();
+        assert_eq!(g, f);
+        assert_eq!(block_on(fs.read(g, 0, 100)).unwrap(), b"payload");
+
+        // Move a (with a nested file) under b: b/a/inner reachable.
+        block_on(fs.create(a, b"inner", 0o644)).unwrap();
+        block_on(fs.rename(ROOT_INO, b"a", b, b"a")).unwrap();
+        assert_eq!(block_on(fs.lookup(ROOT_INO, b"a")).unwrap(), None);
+        assert_eq!(block_on(fs.resolve(&[b"b", b"a", b"inner"])).unwrap() > 0, true);
+    }
+
+    #[test]
+    fn rename_replaces_and_rejects() {
+        let mut fs = fresh();
+        let src = block_on(fs.create(ROOT_INO, b"src", 0o644)).unwrap();
+        block_on(fs.write(src, 0, b"NEW")).unwrap();
+        let dst = block_on(fs.create(ROOT_INO, b"dst", 0o644)).unwrap();
+        block_on(fs.write(dst, 0, b"OLD-and-longer")).unwrap();
+
+        // Replace dst with src.
+        block_on(fs.rename(ROOT_INO, b"src", ROOT_INO, b"dst")).unwrap();
+        assert_eq!(block_on(fs.lookup(ROOT_INO, b"src")).unwrap(), None);
+        let d = block_on(fs.lookup(ROOT_INO, b"dst")).unwrap().unwrap();
+        assert_eq!(d, src);
+        assert_eq!(block_on(fs.read(d, 0, 100)).unwrap(), b"NEW");
+
+        // Type mismatch and non-empty-dir rejection.
+        let dir = block_on(fs.mkdir(ROOT_INO, b"dir", 0o755)).unwrap();
+        block_on(fs.create(dir, b"child", 0o644)).unwrap();
+        assert!(matches!(
+            block_on(fs.rename(ROOT_INO, b"dst", ROOT_INO, b"dir")),
+            Err(StorageError::NotADirectory)
+        ));
+        let dir2 = block_on(fs.mkdir(ROOT_INO, b"dir2", 0o755)).unwrap();
+        let _ = dir2;
+        assert!(matches!(
+            block_on(fs.rename(ROOT_INO, b"dir2", ROOT_INO, b"dir")),
+            Err(StorageError::NotEmpty)
+        ));
+    }
+
+    #[test]
+    fn unlink_reclaims_data_blocks() {
+        // Device is 64 MiB; cycle far more than that through a reused name. If
+        // unlink leaked data extents this would hit NoSpace and panic on unwrap.
+        let mut fs = fresh();
+        let blob = alloc::vec![0x5Au8; 1 << 20]; // 1 MiB (256 blocks)
+        for _ in 0..200 {
+            let f = block_on(fs.create(ROOT_INO, b"tmp", 0o644)).unwrap();
+            block_on(fs.write(f, 0, &blob)).unwrap();
+            block_on(fs.unlink(ROOT_INO, b"tmp")).unwrap();
+        }
+        // ~200 MiB cycled through a 64 MiB device — only possible if reclaimed.
+        assert!(block_on(fs.readdir(ROOT_INO)).unwrap().is_empty());
     }
 
     #[test]

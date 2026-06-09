@@ -7,9 +7,10 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**55 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
-bare-metal RISC-V build green. Mounts via FUSE on Linux and survives a
-torture pass (120 varied-size files, checksums match across remount).**
+**58 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+bare-metal RISC-V build green. Mounts via FUSE on Linux (`mkdir`/`write`/`cat`/
+`ls`/`rm`/`mv`); survives a torture pass (120 varied-size files, checksums match
+across remount).**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -155,7 +156,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     block-granular CoW, checksummed data blocks, birth-gated free, sparse holes;
     `Value::referenced_blocks` so mark-and-sweep keeps data blocks live.
   - [x] FUSE mount on Linux (`rfs-fuse/`) — RFS works as a real mounted directory.
-  - [ ] Phase 2c: per-op batching (FS ops commit-per-op today).
+  - [x] `rename`/`mv` (atomic, replaces dest; dir subtree moves) + fix: `unlink`
+    now frees a file's data extents/blocks at nlink 0 (was leaking them).
+  - [ ] Phase 2c: per-op batching (FS ops commit-per-op today); timestamps.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine
