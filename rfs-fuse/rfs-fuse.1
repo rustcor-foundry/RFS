@@ -1,0 +1,32 @@
+.TH RFS-FUSE 1 "2026" "rfs-fuse" "RFS Manual"
+.SH NAME
+rfs-fuse \- mount an RFS filesystem image via FUSE
+.SH SYNOPSIS
+.B rfs-fuse
+.I image-file mountpoint
+.SH DESCRIPTION
+.B rfs-fuse
+mounts an RFS volume (a single image file) as a directory using FUSE. RFS is a
+copy-on-write, log-structured, self-healing filesystem: it commits atomically
+via a superblock ring, verifies every block against a parent-stored checksum,
+and supports snapshots.
+.PP
+If the image file is empty or does not exist it is created and formatted (64
+MiB by default); otherwise the existing volume is reopened. The process runs in
+the foreground and serves the mount until unmounted with
+.BR fusermount3 (1)
+.RB ( "fusermount3 -u " mountpoint ).
+.SH EXAMPLES
+.nf
+rfs-fuse /var/lib/rfs/data.img /mnt/rfs &
+mkdir /mnt/rfs/docs
+echo hello > /mnt/rfs/docs/a.txt
+fusermount3 -u /mnt/rfs
+.fi
+.SH NOTES
+Writes become durable on
+.BR fsync (2),
+on close, and at unmount; unsynced data may be lost on a crash, as POSIX allows.
+.SH SEE ALSO
+.BR mount.fuse (8),
+.BR fusermount3 (1)
