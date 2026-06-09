@@ -213,6 +213,13 @@ impl<K: Key, V: Value, A: Allocator, D: BlockDevice> Volume<K, V, A, D> {
         self.dev.block_size()
     }
 
+    /// `(total_blocks, free_blocks)` for `statfs`/`df` (approximate while a
+    /// transaction is open).
+    #[must_use]
+    pub fn space(&self) -> (u64, u64) {
+        (self.alloc.total_blocks(), self.alloc.free_blocks())
+    }
+
     /// Allocates a fresh data block, writes `data` (exactly one block), checksums
     /// it, and returns a pointer stamped with the current transaction's `txg`.
     /// Becomes durable when the caller next commits; reclaimed on crash otherwise.

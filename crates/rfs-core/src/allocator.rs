@@ -111,6 +111,13 @@ pub trait Allocator {
     /// `finish_rebuild`) can recompute free space — e.g. after deleting a
     /// snapshot.
     fn reset(&mut self);
+
+    /// Total allocatable blocks (excludes the reserved prefix).
+    fn total_blocks(&self) -> u64;
+
+    /// Blocks currently available to allocate (free segments plus the unused
+    /// tail of each active segment).
+    fn free_blocks(&self) -> u64;
 }
 
 /// Static description of how the device is divided into segments.
@@ -397,6 +404,20 @@ impl Allocator for SegmentAllocator {
         self.active = [None; SegKind::COUNT];
         self.free_segments = self.geom.segment_count - self.geom.reserved_segments;
         self.dirty.clear();
+    }
+
+    fn total_blocks(&self) -> u64 {
+        u64::from(self.geom.segment_count - self.geom.reserved_segments)
+            * u64::from(self.geom.blocks_per_segment)
+    }
+
+    fn free_blocks(&self) -> u64 {
+        let bps = u64::from(self.geom.blocks_per_segment);
+        let mut free = u64::from(self.free_segments) * bps;
+        for seg in self.active.into_iter().flatten() {
+            free += bps - u64::from(self.segments[seg as usize].write_ptr);
+        }
+        free
     }
 }
 
