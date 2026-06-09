@@ -784,6 +784,43 @@ mod tests {
     }
 
     #[test]
+    fn many_files_with_data_survive_remount() {
+        // Mirrors the FUSE torture in-process: a multi-level tree of files with
+        // varied-size data, verified byte-for-byte after remount.
+        let media;
+        {
+            let mut fs = fresh();
+            let d = block_on(fs.mkdir(ROOT_INO, b"d", 0o755)).unwrap();
+            for i in 0..80u64 {
+                let parent = if i % 2 == 0 { ROOT_INO } else { d };
+                let name = alloc::format!("f{i}");
+                let f = block_on(fs.create(parent, name.as_bytes(), 0o644)).unwrap();
+                let len = usize::try_from((i * 37) % 5000 + 1).unwrap();
+                let byte = u8::try_from(i % 251).unwrap();
+                block_on(fs.write(f, 0, &alloc::vec![byte; len])).unwrap();
+            }
+            media = fs.device().snapshot();
+        }
+
+        let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
+        // 40 even-numbered files at root + the "d" directory.
+        assert_eq!(block_on(fs.readdir(ROOT_INO)).unwrap().len(), 41);
+        let d = block_on(fs.lookup(ROOT_INO, b"d")).unwrap().unwrap();
+        assert_eq!(block_on(fs.readdir(d)).unwrap().len(), 40);
+
+        for i in 0..80u64 {
+            let parent = if i % 2 == 0 { ROOT_INO } else { d };
+            let name = alloc::format!("f{i}");
+            let f = block_on(fs.lookup(parent, name.as_bytes())).unwrap().unwrap();
+            let len = usize::try_from((i * 37) % 5000 + 1).unwrap();
+            let byte = u8::try_from(i % 251).unwrap();
+            let got = block_on(fs.read(f, 0, len + 16)).unwrap();
+            assert_eq!(got.len(), len, "file f{i} size after remount");
+            assert!(got.iter().all(|&b| b == byte), "file f{i} content after remount");
+        }
+    }
+
+    #[test]
     fn many_entries_span_multiple_leaves() {
         // Enough entries (and a small-ish tree) to force splits in the dirent range.
         let mut fs = fresh();
