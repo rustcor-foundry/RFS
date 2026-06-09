@@ -282,6 +282,31 @@ impl FuseFs for Adapter {
         }
     }
 
+    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
+        match block_on(self.fs.sync()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        match block_on(self.fs.sync()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn fsyncdir(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        match block_on(self.fs.sync()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn destroy(&mut self) {
+        let _ = block_on(self.fs.sync()); // flush on unmount
+    }
+
     fn readdir(
         &mut self,
         _req: &Request,
