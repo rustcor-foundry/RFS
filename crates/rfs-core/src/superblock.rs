@@ -156,7 +156,8 @@ impl Superblock {
         buf[OFF_ZIL_HEAD..OFF_ZIL_HEAD + 8].copy_from_slice(&self.zil_head.to_le_bytes());
         buf[OFF_SNAPLIST..OFF_SNAPLIST + 8].copy_from_slice(&self.snaplist_root.to_le_bytes());
         buf[OFF_VOLUME_UUID..OFF_VOLUME_UUID + VOLUME_UUID_LEN].copy_from_slice(&self.volume_uuid);
-        buf[OFF_OWNER_HOSTID..OFF_OWNER_HOSTID + 8].copy_from_slice(&self.owner_hostid.to_le_bytes());
+        buf[OFF_OWNER_HOSTID..OFF_OWNER_HOSTID + 8]
+            .copy_from_slice(&self.owner_hostid.to_le_bytes());
         buf[OFF_MMP_SEQ..OFF_MMP_SEQ + 8].copy_from_slice(&self.mmp_seq.to_le_bytes());
 
         let len = buf.len();
@@ -199,7 +200,9 @@ impl Superblock {
             txg: u64::from_le_bytes(buf[OFF_TXG..OFF_TXG + 8].try_into().unwrap()),
             flags: u64::from_le_bytes(buf[OFF_FLAGS..OFF_FLAGS + 8].try_into().unwrap()),
             digest,
-            root_addr: u64::from_le_bytes(buf[OFF_ROOT_ADDR..OFF_ROOT_ADDR + 8].try_into().unwrap()),
+            root_addr: u64::from_le_bytes(
+                buf[OFF_ROOT_ADDR..OFF_ROOT_ADDR + 8].try_into().unwrap(),
+            ),
             root_birth_txg: u64::from_le_bytes(
                 buf[OFF_ROOT_BIRTH..OFF_ROOT_BIRTH + 8].try_into().unwrap(),
             ),
@@ -212,7 +215,9 @@ impl Superblock {
                 .try_into()
                 .unwrap(),
             owner_hostid: u64::from_le_bytes(
-                buf[OFF_OWNER_HOSTID..OFF_OWNER_HOSTID + 8].try_into().unwrap(),
+                buf[OFF_OWNER_HOSTID..OFF_OWNER_HOSTID + 8]
+                    .try_into()
+                    .unwrap(),
             ),
             mmp_seq: u64::from_le_bytes(buf[OFF_MMP_SEQ..OFF_MMP_SEQ + 8].try_into().unwrap()),
         }))

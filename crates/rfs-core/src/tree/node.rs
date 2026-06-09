@@ -129,8 +129,8 @@ impl<K: Key, V: Value> Node<K, V> {
                 if !leaf_fits::<K, V>(&leaf.entries, buf.len()) {
                     return Err(StorageError::BufferSize);
                 }
-                let count = u16::try_from(leaf.entries.len())
-                    .map_err(|_| StorageError::BufferSize)?;
+                let count =
+                    u16::try_from(leaf.entries.len()).map_err(|_| StorageError::BufferSize)?;
                 buf[OFF_LEVEL] = 0;
                 buf[OFF_COUNT..OFF_COUNT + 2].copy_from_slice(&count.to_le_bytes());
                 buf[OFF_GENERATION..OFF_GENERATION + 8]
@@ -159,8 +159,7 @@ impl<K: Key, V: Value> Node<K, V> {
                 if node.keys.len() > max_internal_keys::<K>(buf.len(), digest_len) {
                     return Err(StorageError::BufferSize);
                 }
-                let count =
-                    u16::try_from(node.keys.len()).map_err(|_| StorageError::BufferSize)?;
+                let count = u16::try_from(node.keys.len()).map_err(|_| StorageError::BufferSize)?;
                 buf[OFF_LEVEL] = node.level;
                 buf[OFF_COUNT..OFF_COUNT + 2].copy_from_slice(&count.to_le_bytes());
                 buf[OFF_GENERATION..OFF_GENERATION + 8]
@@ -199,8 +198,9 @@ impl<K: Key, V: Value> Node<K, V> {
             return Err(StorageError::Corrupt(CorruptKind::BadMagic));
         }
         let level = buf[OFF_LEVEL];
-        let count =
-            usize::from(u16::from_le_bytes(buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap()));
+        let count = usize::from(u16::from_le_bytes(
+            buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap(),
+        ));
         let generation =
             u64::from_le_bytes(buf[OFF_GENERATION..OFF_GENERATION + 8].try_into().unwrap());
 
@@ -459,8 +459,7 @@ mod tests {
         let node = leaf(&[(1, 11), (2, 22), (3, 33)]);
         let ptr = block_on(write_node(&node, 7, &mut alloc, &dev, &mut pool, hasher)).unwrap();
         assert_eq!(ptr.birth_txg, 7);
-        let back: Node<u64, u64> =
-            block_on(read_node(&ptr, &dev, &mut pool, hasher)).unwrap();
+        let back: Node<u64, u64> = block_on(read_node(&ptr, &dev, &mut pool, hasher)).unwrap();
         assert_eq!(back, node);
     }
 
@@ -476,8 +475,7 @@ mod tests {
         victim[HEADER_LEN_TEST] ^= 0xFF;
         block_on(dev.write_block(ptr.addr, &victim)).unwrap();
 
-        let result: Result<Node<u64, u64>, _> =
-            block_on(read_node(&ptr, &dev, &mut pool, hasher));
+        let result: Result<Node<u64, u64>, _> = block_on(read_node(&ptr, &dev, &mut pool, hasher));
         assert_eq!(
             result,
             Err(StorageError::Corrupt(CorruptKind::BadChecksum)),

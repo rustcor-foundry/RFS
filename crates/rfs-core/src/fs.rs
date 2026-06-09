@@ -290,7 +290,8 @@ impl Value for FsValue {
                 let mut o = 3;
                 for _ in 0..count {
                     let ino = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
-                    let nlen = usize::from(u16::from_le_bytes(buf[o + 8..o + 10].try_into().unwrap()));
+                    let nlen =
+                        usize::from(u16::from_le_bytes(buf[o + 8..o + 10].try_into().unwrap()));
                     let name = buf[o + 10..o + 10 + nlen].to_vec();
                     entries.push(DirEntry { ino, name });
                     o += 10 + nlen;
@@ -350,10 +351,17 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             },
         )
         .await?;
-        vol.insert(FsKey::inode(ROOT_INO), FsValue::Inode(Inode::new_dir(0o755)))
-            .await?;
+        vol.insert(
+            FsKey::inode(ROOT_INO),
+            FsValue::Inode(Inode::new_dir(0o755)),
+        )
+        .await?;
         vol.commit().await?;
-        Ok(Self { vol, dirty: 0, now: 0 })
+        Ok(Self {
+            vol,
+            dirty: 0,
+            now: 0,
+        })
     }
 
     /// Mounts an existing filesystem.
@@ -460,7 +468,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     }
 
     async fn write_inode(&mut self, ino: u64, inode: Inode) -> Result<(), StorageError> {
-        self.vol.insert(FsKey::inode(ino), FsValue::Inode(inode)).await
+        self.vol
+            .insert(FsKey::inode(ino), FsValue::Inode(inode))
+            .await
     }
 
     async fn bucket(&mut self, dir: u64, hash: u64) -> Result<Vec<DirEntry>, StorageError> {
@@ -486,7 +496,10 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     pub async fn resolve(&mut self, components: &[&[u8]]) -> Result<u64, StorageError> {
         let mut ino = ROOT_INO;
         for comp in components {
-            ino = self.lookup(ino, comp).await?.ok_or(StorageError::NotFound)?;
+            ino = self
+                .lookup(ino, comp)
+                .await?
+                .ok_or(StorageError::NotFound)?;
         }
         Ok(ino)
     }
@@ -509,7 +522,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             ino: child,
             name: name.to_vec(),
         });
-        self.vol.insert(FsKey::dirent(dir, hash), FsValue::Dirent(bucket)).await
+        self.vol
+            .insert(FsKey::dirent(dir, hash), FsValue::Dirent(bucket))
+            .await
     }
 
     async fn unlink_entry(&mut self, dir: u64, name: &[u8]) -> Result<u64, StorageError> {
@@ -523,7 +538,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         if bucket.is_empty() {
             self.vol.delete(&FsKey::dirent(dir, hash)).await?;
         } else {
-            self.vol.insert(FsKey::dirent(dir, hash), FsValue::Dirent(bucket)).await?;
+            self.vol
+                .insert(FsKey::dirent(dir, hash), FsValue::Dirent(bucket))
+                .await?;
         }
         Ok(child)
     }
@@ -532,13 +549,19 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     ///
     /// # Errors
     /// [`StorageError::AlreadyExists`], [`StorageError::NotADirectory`], or I/O.
-    pub async fn mkdir(&mut self, parent: u64, name: &[u8], mode: u32) -> Result<u64, StorageError> {
+    pub async fn mkdir(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+    ) -> Result<u64, StorageError> {
         let pinode = self.read_inode(parent).await?;
         if !pinode.is_dir() {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_dir(mode).stamped(self.now)).await?;
+        self.write_inode(ino, Inode::new_dir(mode).stamped(self.now))
+            .await?;
         self.link(parent, name, ino).await?;
         // Parent gains a link from the child's "..", and its contents changed.
         let mut p = self.read_inode(parent).await?;
@@ -554,13 +577,19 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     ///
     /// # Errors
     /// [`StorageError::AlreadyExists`], [`StorageError::NotADirectory`], or I/O.
-    pub async fn create(&mut self, parent: u64, name: &[u8], mode: u32) -> Result<u64, StorageError> {
+    pub async fn create(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+    ) -> Result<u64, StorageError> {
         let pinode = self.read_inode(parent).await?;
         if !pinode.is_dir() {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_file(mode).stamped(self.now)).await?;
+        self.write_inode(ino, Inode::new_file(mode).stamped(self.now))
+            .await?;
         self.link(parent, name, ino).await?;
         self.bump_times(parent).await?;
         self.checkpoint(1).await?;
@@ -708,7 +737,10 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     /// # Errors
     /// [`StorageError::NotFound`], [`StorageError::NotEmpty`], or I/O.
     pub async fn rmdir(&mut self, parent: u64, name: &[u8]) -> Result<(), StorageError> {
-        let dir = self.lookup(parent, name).await?.ok_or(StorageError::NotFound)?;
+        let dir = self
+            .lookup(parent, name)
+            .await?
+            .ok_or(StorageError::NotFound)?;
         if !self.readdir(dir).await?.is_empty() {
             return Err(StorageError::NotEmpty);
         }
@@ -722,7 +754,11 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         self.checkpoint(1).await
     }
 
-    async fn get_extent(&mut self, ino: u64, block_off: u64) -> Result<Option<BlockPtr>, StorageError> {
+    async fn get_extent(
+        &mut self,
+        ino: u64,
+        block_off: u64,
+    ) -> Result<Option<BlockPtr>, StorageError> {
         match self.vol.get(&FsKey::extent(ino, block_off)).await? {
             Some(FsValue::Extent(ptr)) => Ok(Some(ptr)),
             _ => Ok(None),
@@ -780,7 +816,12 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     /// [`StorageError::NotFound`] or I/O / verification errors.
     // Within-block offsets are bounded by the block size, which fits `usize`.
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn read(&mut self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+    pub async fn read(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, StorageError> {
         let bs = self.vol.block_size();
         let bs64 = bs as u64;
         let inode = self.read_inode(ino).await?;
@@ -846,7 +887,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             buf[within..].fill(0);
             self.vol.free_data_block(old);
             let ptr = self.vol.alloc_data_block(&buf).await?;
-            self.vol.insert(FsKey::extent(ino, block_off), FsValue::Extent(ptr)).await?;
+            self.vol
+                .insert(FsKey::extent(ino, block_off), FsValue::Extent(ptr))
+                .await?;
         }
 
         inode.size = size;
@@ -860,12 +903,18 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     ///
     /// # Errors
     /// [`StorageError::AlreadyExists`], [`StorageError::NotADirectory`], or I/O.
-    pub async fn symlink(&mut self, parent: u64, name: &[u8], target: &[u8]) -> Result<u64, StorageError> {
+    pub async fn symlink(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<u64, StorageError> {
         if !self.read_inode(parent).await?.is_dir() {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_symlink().stamped(self.now)).await?;
+        self.write_inode(ino, Inode::new_symlink().stamped(self.now))
+            .await?;
         self.write(ino, 0, target).await?; // store target as the link's data
         self.link(parent, name, ino).await?;
         self.bump_times(parent).await?;
@@ -882,7 +931,8 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         if !inode.is_symlink() {
             return Err(StorageError::NotPermitted);
         }
-        self.read(ino, 0, usize::try_from(inode.size).unwrap_or(usize::MAX)).await
+        self.read(ino, 0, usize::try_from(inode.size).unwrap_or(usize::MAX))
+            .await
     }
 
     /// Creates a hard link `name` in `parent` to the existing file `target`.
@@ -890,7 +940,12 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     /// # Errors
     /// [`StorageError::NotPermitted`] (linking a directory),
     /// [`StorageError::AlreadyExists`], or I/O.
-    pub async fn hard_link(&mut self, parent: u64, name: &[u8], target: u64) -> Result<(), StorageError> {
+    pub async fn hard_link(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        target: u64,
+    ) -> Result<(), StorageError> {
         let mut inode = self.read_inode(target).await?;
         if inode.is_dir() {
             return Err(StorageError::NotPermitted);
@@ -929,10 +984,17 @@ mod tests {
     type Fs = Filesystem<SegmentAllocator, MemDevice>;
 
     fn fresh() -> Fs {
-        block_on(Filesystem::format(MemDevice::new(BS, BLOCKS), alloc(), DigestMode::Fast64)).unwrap()
+        block_on(Filesystem::format(
+            MemDevice::new(BS, BLOCKS),
+            alloc(),
+            DigestMode::Fast64,
+        ))
+        .unwrap()
     }
 
-    fn names(mut entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)>) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    fn names(
+        mut entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)>,
+    ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         entries.sort();
         entries.into_iter().map(|(n, _)| n).collect()
     }
@@ -945,12 +1007,24 @@ mod tests {
         let notes = block_on(fs.create(docs, b"notes.txt", 0o644)).unwrap();
 
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"docs")).unwrap(), Some(docs));
-        assert_eq!(block_on(fs.lookup(ROOT_INO, b"README")).unwrap(), Some(readme));
+        assert_eq!(
+            block_on(fs.lookup(ROOT_INO, b"README")).unwrap(),
+            Some(readme)
+        );
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"missing")).unwrap(), None);
-        assert_eq!(block_on(fs.resolve(&[b"docs", b"notes.txt"])).unwrap(), notes);
+        assert_eq!(
+            block_on(fs.resolve(&[b"docs", b"notes.txt"])).unwrap(),
+            notes
+        );
 
-        assert_eq!(names(block_on(fs.readdir(ROOT_INO)).unwrap()), [b"README".to_vec(), b"docs".to_vec()]);
-        assert_eq!(names(block_on(fs.readdir(docs)).unwrap()), [b"notes.txt".to_vec()]);
+        assert_eq!(
+            names(block_on(fs.readdir(ROOT_INO)).unwrap()),
+            [b"README".to_vec(), b"docs".to_vec()]
+        );
+        assert_eq!(
+            names(block_on(fs.readdir(docs)).unwrap()),
+            [b"notes.txt".to_vec()]
+        );
 
         assert!(block_on(fs.getattr(docs)).unwrap().is_dir());
         assert!(!block_on(fs.getattr(readme)).unwrap().is_dir());
@@ -977,7 +1051,10 @@ mod tests {
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"f")).unwrap(), None);
 
         // Non-empty dir cannot be removed.
-        assert!(matches!(block_on(fs.rmdir(ROOT_INO, b"d")), Err(StorageError::NotEmpty)));
+        assert!(matches!(
+            block_on(fs.rmdir(ROOT_INO, b"d")),
+            Err(StorageError::NotEmpty)
+        ));
         block_on(fs.unlink(d, b"inner")).unwrap();
         block_on(fs.rmdir(ROOT_INO, b"d")).unwrap();
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"d")).unwrap(), None);
@@ -998,7 +1075,10 @@ mod tests {
         }
         let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"docs")).unwrap(), Some(docs));
-        assert_eq!(names(block_on(fs.readdir(docs)).unwrap()), [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(
+            names(block_on(fs.readdir(docs)).unwrap()),
+            [b"a".to_vec(), b"b".to_vec()]
+        );
     }
 
     #[test]
@@ -1055,7 +1135,10 @@ mod tests {
 
         // Grow back: the gap is a hole (zeros), not the old data.
         block_on(fs.truncate(f, 10)).unwrap();
-        assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            block_on(fs.read(f, 0, 100)).unwrap(),
+            [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -1065,7 +1148,10 @@ mod tests {
         assert!(block_on(fs.getattr(s)).unwrap().is_symlink());
         assert_eq!(block_on(fs.readlink(s)).unwrap(), b"/some/where/target");
         let f = block_on(fs.create(ROOT_INO, b"f", 0o644)).unwrap();
-        assert!(matches!(block_on(fs.readlink(f)), Err(StorageError::NotPermitted)));
+        assert!(matches!(
+            block_on(fs.readlink(f)),
+            Err(StorageError::NotPermitted)
+        ));
     }
 
     #[test]
@@ -1102,8 +1188,16 @@ mod tests {
         fs.set_time(1000);
         let f = block_on(fs.create(ROOT_INO, b"a", 0o644)).unwrap();
         let i = block_on(fs.getattr(f)).unwrap();
-        assert_eq!((i.atime, i.mtime, i.ctime), (1000, 1000, 1000), "new file stamped");
-        assert_eq!(block_on(fs.getattr(ROOT_INO)).unwrap().mtime, 1000, "parent mtime bumped");
+        assert_eq!(
+            (i.atime, i.mtime, i.ctime),
+            (1000, 1000, 1000),
+            "new file stamped"
+        );
+        assert_eq!(
+            block_on(fs.getattr(ROOT_INO)).unwrap().mtime,
+            1000,
+            "parent mtime bumped"
+        );
 
         fs.set_time(2000);
         block_on(fs.write(f, 0, b"x")).unwrap();
@@ -1114,7 +1208,11 @@ mod tests {
         fs.set_time(3000);
         block_on(fs.set_times(f, Some(500), Some(600))).unwrap();
         let i3 = block_on(fs.getattr(f)).unwrap();
-        assert_eq!((i3.atime, i3.mtime, i3.ctime), (500, 600, 3000), "utimes sets a/mtime, ctime=now");
+        assert_eq!(
+            (i3.atime, i3.mtime, i3.ctime),
+            (500, 600, 3000),
+            "utimes sets a/mtime, ctime=now"
+        );
     }
 
     #[test]
@@ -1127,7 +1225,10 @@ mod tests {
         let f = block_on(fs.create(ROOT_INO, b"big", 0o644)).unwrap();
         block_on(fs.write(f, 0, &alloc::vec![1u8; 2_000_000])).unwrap();
         let (_, _, free1) = fs.statfs();
-        assert!(free1 < free0, "writing ~2 MiB should reduce free space: {free0} -> {free1}");
+        assert!(
+            free1 < free0,
+            "writing ~2 MiB should reduce free space: {free0} -> {free1}"
+        );
     }
 
     #[test]
@@ -1141,10 +1242,16 @@ mod tests {
         // No sync yet: everything is still in the in-memory txg shadow, so the
         // 100 mkdirs caused (almost) no device writes — they coalesce.
         let during = fs.device().write_count() - before;
-        assert!(during < 20, "expected batching, got {during} device writes for 100 mkdirs");
+        assert!(
+            during < 20,
+            "expected batching, got {during} device writes for 100 mkdirs"
+        );
 
         block_on(fs.sync()).unwrap();
-        assert!(fs.device().write_count() > before, "sync must flush to device");
+        assert!(
+            fs.device().write_count() > before,
+            "sync must flush to device"
+        );
         // And all 100 are durable + visible.
         assert_eq!(block_on(fs.readdir(ROOT_INO)).unwrap().len(), 100);
     }
@@ -1168,7 +1275,10 @@ mod tests {
         block_on(fs.create(a, b"inner", 0o644)).unwrap();
         block_on(fs.rename(ROOT_INO, b"a", b, b"a")).unwrap();
         assert_eq!(block_on(fs.lookup(ROOT_INO, b"a")).unwrap(), None);
-        assert_eq!(block_on(fs.resolve(&[b"b", b"a", b"inner"])).unwrap() > 0, true);
+        assert_eq!(
+            block_on(fs.resolve(&[b"b", b"a", b"inner"])).unwrap() > 0,
+            true
+        );
     }
 
     #[test]
@@ -1245,12 +1355,17 @@ mod tests {
         for i in 0..80u64 {
             let parent = if i % 2 == 0 { ROOT_INO } else { d };
             let name = alloc::format!("f{i}");
-            let f = block_on(fs.lookup(parent, name.as_bytes())).unwrap().unwrap();
+            let f = block_on(fs.lookup(parent, name.as_bytes()))
+                .unwrap()
+                .unwrap();
             let len = usize::try_from((i * 37) % 5000 + 1).unwrap();
             let byte = u8::try_from(i % 251).unwrap();
             let got = block_on(fs.read(f, 0, len + 16)).unwrap();
             assert_eq!(got.len(), len, "file f{i} size after remount");
-            assert!(got.iter().all(|&b| b == byte), "file f{i} content after remount");
+            assert!(
+                got.iter().all(|&b| b == byte),
+                "file f{i} content after remount"
+            );
         }
     }
 
@@ -1267,7 +1382,11 @@ mod tests {
         // Every created name is present and resolves.
         for i in 0..200u64 {
             let name = alloc::format!("file{i:04}");
-            assert!(block_on(fs.lookup(ROOT_INO, name.as_bytes())).unwrap().is_some());
+            assert!(
+                block_on(fs.lookup(ROOT_INO, name.as_bytes()))
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 }

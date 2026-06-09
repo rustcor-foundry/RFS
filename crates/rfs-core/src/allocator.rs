@@ -226,10 +226,9 @@ impl SegmentAllocator {
     /// `usize` on this target.
     #[must_use]
     pub fn new(geom: SegmentGeom) -> Self {
-        let total_blocks = usize::try_from(
-            u64::from(geom.segment_count) * u64::from(geom.blocks_per_segment),
-        )
-        .expect("device block count fits usize");
+        let total_blocks =
+            usize::try_from(u64::from(geom.segment_count) * u64::from(geom.blocks_per_segment))
+                .expect("device block count fits usize");
 
         let mut segments = Vec::with_capacity(geom.segment_count as usize);
         for seg in 0..geom.segment_count {
@@ -439,9 +438,19 @@ mod tests {
         let mut a = SegmentAllocator::new(geom());
         let blocks = alloc_n(&mut a, SegKind::Data, 5);
         // First four fill one segment (sequential), fifth jumps to a new segment.
-        assert_eq!(&blocks[..4], &[blocks[0], blocks[0] + 1, blocks[0] + 2, blocks[0] + 3]);
-        assert_ne!(blocks[4] / 4, blocks[3] / 4, "5th block must be in a new segment");
-        assert!(blocks.iter().all(|&b| b >= 4), "reserved segment 0 never handed out");
+        assert_eq!(
+            &blocks[..4],
+            &[blocks[0], blocks[0] + 1, blocks[0] + 2, blocks[0] + 3]
+        );
+        assert_ne!(
+            blocks[4] / 4,
+            blocks[3] / 4,
+            "5th block must be in a new segment"
+        );
+        assert!(
+            blocks.iter().all(|&b| b >= 4),
+            "reserved segment 0 never handed out"
+        );
     }
 
     #[test]
@@ -469,7 +478,10 @@ mod tests {
             free_before,
             "freed segment must NOT be reusable before commit"
         );
-        assert!(seg1.iter().all(|&b| !a.is_allocated(b)), "blocks no longer live");
+        assert!(
+            seg1.iter().all(|&b| !a.is_allocated(b)),
+            "blocks no longer live"
+        );
 
         a.commit();
         assert_eq!(

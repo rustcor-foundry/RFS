@@ -148,7 +148,15 @@ impl<K: Key, V: Value> Txg<K, V> {
             }
             Some(mut slot) => {
                 let split = insert_rec(
-                    &mut slot, key, val, dev, pool, hasher, block_size, max_int, &mut self.freed,
+                    &mut slot,
+                    key,
+                    val,
+                    dev,
+                    pool,
+                    hasher,
+                    block_size,
+                    max_int,
+                    &mut self.freed,
                 )
                 .await?;
                 root = Some(match split {
@@ -272,7 +280,9 @@ fn range_slot<'f, K: Key, V: Value, D: BlockDevice>(
 ) -> Fut<'f, ()> {
     Box::pin(async move {
         match slot {
-            Slot::Disk(ptr) => range_disk::<K, V, D>(*ptr, start, end, dev, pool, hasher, out).await,
+            Slot::Disk(ptr) => {
+                range_disk::<K, V, D>(*ptr, start, end, dev, pool, hasher, out).await
+            }
             Slot::Mem(node) => match &**node {
                 DNode::Leaf(entries) => {
                     for (k, v) in entries {
@@ -289,13 +299,7 @@ fn range_slot<'f, K: Key, V: Value, D: BlockDevice>(
                         let above_start = i == n || *start < keys[i];
                         if below_end && above_start {
                             range_slot::<K, V, D>(
-                                &kids[i],
-                                start,
-                                end,
-                                dev,
-                                &mut *pool,
-                                hasher,
-                                &mut *out,
+                                &kids[i], start, end, dev, &mut *pool, hasher, &mut *out,
                             )
                             .await?;
                         }

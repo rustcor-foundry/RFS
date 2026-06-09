@@ -556,11 +556,17 @@ mod tests {
             assert!(block_on(tree.delete(&k, &mut txn(&mut e, 100))).unwrap());
         }
         for k in 0..60u64 {
-            assert_eq!(block_on(tree.get(&k, &e.dev, &mut e.pool, e.hasher)).unwrap(), None);
+            assert_eq!(
+                block_on(tree.get(&k, &e.dev, &mut e.pool, e.hasher)).unwrap(),
+                None
+            );
         }
         // Tree still usable after emptying.
         block_on(tree.insert(7, 777, &mut txn(&mut e, 101))).unwrap();
-        assert_eq!(block_on(tree.get(&7, &e.dev, &mut e.pool, e.hasher)).unwrap(), Some(777));
+        assert_eq!(
+            block_on(tree.get(&7, &e.dev, &mut e.pool, e.hasher)).unwrap(),
+            Some(777)
+        );
     }
 
     #[test]
@@ -573,7 +579,11 @@ mod tests {
 
         // A third insert publishes a new root; the old one must be untouched.
         block_on(tree.insert(3, 33, &mut txn(&mut e, 3))).unwrap();
-        assert_ne!(tree.root.unwrap(), old_root, "insert must produce a new root");
+        assert_ne!(
+            tree.root.unwrap(),
+            old_root,
+            "insert must produce a new root"
+        );
 
         let snapshot = Tree::<u64, u64>::at(old_root);
         assert_eq!(

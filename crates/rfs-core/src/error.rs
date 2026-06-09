@@ -59,9 +59,8 @@ impl From<crate::allocator::AllocError> for StorageError {
     fn from(err: crate::allocator::AllocError) -> Self {
         match err {
             crate::allocator::AllocError::NoSpace => Self::NoSpace,
-            crate::allocator::AllocError::OutOfRange | crate::allocator::AllocError::NotAllocated => {
-                Self::Io
-            }
+            crate::allocator::AllocError::OutOfRange
+            | crate::allocator::AllocError::NotAllocated => Self::Io,
         }
     }
 }

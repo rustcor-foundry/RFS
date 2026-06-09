@@ -108,7 +108,11 @@ fn encode<K: Key, V: Value>(
 
 /// Returns the records of a valid block, or `None` for end-of-log (bad magic,
 /// torn checksum, stale `txg`, wrong `seq`, or a malformed/overrunning record).
-fn decode<K: Key, V: Value>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Option<Vec<ZilRecord<K, V>>> {
+fn decode<K: Key, V: Value>(
+    buf: &[u8],
+    expect_txg: u64,
+    expect_seq: u64,
+) -> Option<Vec<ZilRecord<K, V>>> {
     if u32::from_le_bytes(buf[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap()) != MAGIC {
         return None;
     }
@@ -123,7 +127,9 @@ fn decode<K: Key, V: Value>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Opt
     if u64::from_le_bytes(buf[OFF_SEQ..OFF_SEQ + 8].try_into().unwrap()) != expect_seq {
         return None;
     }
-    let count = usize::from(u16::from_le_bytes(buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap()));
+    let count = usize::from(u16::from_le_bytes(
+        buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap(),
+    ));
 
     let payload_end = len - 8;
     let mut o = HEADER_LEN;
@@ -142,7 +148,10 @@ fn decode<K: Key, V: Value>(buf: &[u8], expect_txg: u64, expect_seq: u64) -> Opt
             return None;
         }
         match tag {
-            TAG_INSERT => out.push(ZilRecord::Insert(key, V::decode(&buf[vstart..vstart + vlen]))),
+            TAG_INSERT => out.push(ZilRecord::Insert(
+                key,
+                V::decode(&buf[vstart..vstart + vlen]),
+            )),
             TAG_DELETE => out.push(ZilRecord::Delete(key)),
             _ => return None,
         }

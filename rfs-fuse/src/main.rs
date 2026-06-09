@@ -67,11 +67,15 @@ impl BlockDevice for FileDevice {
     }
     async fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         let off = self.offset(lba)?;
-        self.file.read_exact_at(buf, off).map_err(|_| StorageError::Io)
+        self.file
+            .read_exact_at(buf, off)
+            .map_err(|_| StorageError::Io)
     }
     async fn write_block(&self, lba: u64, buf: &[u8]) -> Result<(), StorageError> {
         let off = self.offset(lba)?;
-        self.file.write_all_at(buf, off).map_err(|_| StorageError::Io)
+        self.file
+            .write_all_at(buf, off)
+            .map_err(|_| StorageError::Io)
     }
     async fn flush(&self) -> Result<(), StorageError> {
         self.file.sync_data().map_err(|_| StorageError::Io)
@@ -270,7 +274,10 @@ impl FuseFs for Adapter {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             };
-            if let Err(e) = block_on(self.fs.set_times(ino, atime.map(to_secs), mtime.map(to_secs))) {
+            if let Err(e) = block_on(
+                self.fs
+                    .set_times(ino, atime.map(to_secs), mtime.map(to_secs)),
+            ) {
                 reply.error(errno(&e));
                 return;
             }
@@ -308,12 +315,10 @@ impl FuseFs for Adapter {
         reply: ReplyEmpty,
     ) {
         self.tick();
-        match block_on(self.fs.rename(
-            parent,
-            name.as_bytes(),
-            newparent,
-            newname.as_bytes(),
-        )) {
+        match block_on(
+            self.fs
+                .rename(parent, name.as_bytes(), newparent, newname.as_bytes()),
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
@@ -333,7 +338,14 @@ impl FuseFs for Adapter {
         }
     }
 
-    fn fsyncdir(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsyncdir(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         match block_on(self.fs.sync()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -438,7 +450,9 @@ fn main() {
         std::process::exit(2);
     };
 
-    let existing = std::fs::metadata(&image).map(|m| m.len() > 0).unwrap_or(false);
+    let existing = std::fs::metadata(&image)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
