@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem as FuseFs, MountOption, ReplyAttr, ReplyCreate, ReplyData,
@@ -95,6 +95,14 @@ fn errno(err: &StorageError) -> i32 {
     }
 }
 
+/// Seconds since the Unix epoch (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 struct Adapter {
     fs: Filesystem<SegmentAllocator, FileDevice>,
     uid: u32,
@@ -102,6 +110,11 @@ struct Adapter {
 }
 
 impl Adapter {
+    /// Injects the current wall clock before a mutating operation.
+    fn tick(&mut self) {
+        self.fs.set_time(now_secs());
+    }
+
     fn attr(&self, ino: u64, inode: &Inode) -> FileAttr {
         let kind = if inode.is_dir() {
             FileType::Directory
@@ -114,10 +127,10 @@ impl Adapter {
             ino,
             size: inode.size,
             blocks: inode.size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: UNIX_EPOCH + Duration::from_secs(inode.atime),
+            mtime: UNIX_EPOCH + Duration::from_secs(inode.mtime),
+            ctime: UNIX_EPOCH + Duration::from_secs(inode.ctime),
+            crtime: UNIX_EPOCH + Duration::from_secs(inode.ctime),
             kind,
             perm: (inode.mode & 0o7777) as u16,
             nlink: inode.nlink,
@@ -158,6 +171,7 @@ impl FuseFs for Adapter {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        self.tick();
         match block_on(self.fs.mkdir(parent, name.as_bytes(), mode)) {
             Ok(ino) => match block_on(self.fs.getattr(ino)) {
                 Ok(inode) => reply.entry(&TTL, &self.attr(ino, &inode), 0),
@@ -177,6 +191,7 @@ impl FuseFs for Adapter {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        self.tick();
         match block_on(self.fs.create(parent, name.as_bytes(), mode)) {
             Ok(ino) => match block_on(self.fs.getattr(ino)) {
                 Ok(inode) => reply.created(&TTL, &self.attr(ino, &inode), 0, 0, 0),
@@ -215,6 +230,7 @@ impl FuseFs for Adapter {
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
+        self.tick();
         match block_on(self.fs.write(ino, offset.max(0) as u64, data)) {
             Ok(()) => reply.written(data.len() as u32),
             Err(e) => reply.error(errno(&e)),
@@ -229,18 +245,32 @@ impl FuseFs for Adapter {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<std::time::SystemTime>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
         _fh: Option<u64>,
-        _crtime: Option<std::time::SystemTime>,
-        _chgtime: Option<std::time::SystemTime>,
-        _bkuptime: Option<std::time::SystemTime>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        self.tick();
         if let Some(new_size) = size {
             if let Err(e) = block_on(self.fs.truncate(ino, new_size)) {
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let to_secs = |t: fuser::TimeOrNow| match t {
+                fuser::TimeOrNow::Now => now_secs(),
+                fuser::TimeOrNow::SpecificTime(st) => st
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = block_on(self.fs.set_times(ino, atime.map(to_secs), mtime.map(to_secs))) {
                 reply.error(errno(&e));
                 return;
             }
@@ -252,6 +282,7 @@ impl FuseFs for Adapter {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.tick();
         match block_on(self.fs.unlink(parent, name.as_bytes())) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -259,6 +290,7 @@ impl FuseFs for Adapter {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.tick();
         match block_on(self.fs.rmdir(parent, name.as_bytes())) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -275,6 +307,7 @@ impl FuseFs for Adapter {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        self.tick();
         match block_on(self.fs.rename(
             parent,
             name.as_bytes(),
@@ -326,6 +359,7 @@ impl FuseFs for Adapter {
         link: &Path,
         reply: ReplyEntry,
     ) {
+        self.tick();
         let target = link.as_os_str().as_bytes();
         match block_on(self.fs.symlink(parent, name.as_bytes(), target)) {
             Ok(ino) => match block_on(self.fs.getattr(ino)) {
@@ -351,6 +385,7 @@ impl FuseFs for Adapter {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        self.tick();
         match block_on(self.fs.hard_link(newparent, newname.as_bytes(), ino)) {
             Ok(()) => match block_on(self.fs.getattr(ino)) {
                 Ok(inode) => reply.entry(&TTL, &self.attr(ino, &inode), 0),

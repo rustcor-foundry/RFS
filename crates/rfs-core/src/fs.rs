@@ -99,7 +99,8 @@ impl Record for FsKey {
 
 impl Key for FsKey {}
 
-/// Per-object metadata.
+/// Per-object metadata. Times are seconds since the Unix epoch (the host injects
+/// the clock via [`Filesystem::set_time`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Inode {
     /// Type + permission bits (POSIX `mode`).
@@ -108,8 +109,12 @@ pub struct Inode {
     pub nlink: u32,
     /// Size in bytes.
     pub size: u64,
-    /// Modification time (opaque tick; the host sets the clock).
+    /// Access time.
+    pub atime: u64,
+    /// Modification time (data last changed).
     pub mtime: u64,
+    /// Change time (metadata last changed).
+    pub ctime: u64,
 }
 
 impl Inode {
@@ -120,7 +125,9 @@ impl Inode {
             mode: S_IFDIR | (mode & 0o7777),
             nlink: 2,
             size: 0,
+            atime: 0,
             mtime: 0,
+            ctime: 0,
         }
     }
 
@@ -131,7 +138,9 @@ impl Inode {
             mode: S_IFREG | (mode & 0o7777),
             nlink: 1,
             size: 0,
+            atime: 0,
             mtime: 0,
+            ctime: 0,
         }
     }
 
@@ -142,7 +151,9 @@ impl Inode {
             mode: S_IFLNK | 0o777,
             nlink: 1,
             size: 0,
+            atime: 0,
             mtime: 0,
+            ctime: 0,
         }
     }
 
@@ -156,6 +167,15 @@ impl Inode {
     #[must_use]
     pub fn is_symlink(&self) -> bool {
         self.mode & S_IFMT == S_IFLNK
+    }
+
+    /// Sets all three timestamps to `now` (for a freshly created object).
+    #[must_use]
+    fn stamped(mut self, now: u64) -> Self {
+        self.atime = now;
+        self.mtime = now;
+        self.ctime = now;
+        self
     }
 }
 
@@ -195,7 +215,7 @@ impl Value for FsValue {
     fn encoded_len(&self) -> usize {
         1 + match self {
             Self::Super { .. } => 16,
-            Self::Inode(_) => 24,
+            Self::Inode(_) => 40,
             Self::Dirent(entries) => {
                 2 + entries.iter().map(|e| 8 + 2 + e.name.len()).sum::<usize>()
             }
@@ -215,7 +235,9 @@ impl Value for FsValue {
                 out[1..5].copy_from_slice(&i.mode.to_le_bytes());
                 out[5..9].copy_from_slice(&i.nlink.to_le_bytes());
                 out[9..17].copy_from_slice(&i.size.to_le_bytes());
-                out[17..25].copy_from_slice(&i.mtime.to_le_bytes());
+                out[17..25].copy_from_slice(&i.atime.to_le_bytes());
+                out[25..33].copy_from_slice(&i.mtime.to_le_bytes());
+                out[33..41].copy_from_slice(&i.ctime.to_le_bytes());
             }
             Self::Dirent(entries) => {
                 out[0] = TAG_DIRENT;
@@ -249,7 +271,9 @@ impl Value for FsValue {
                 mode: u32::from_le_bytes(buf[1..5].try_into().unwrap()),
                 nlink: u32::from_le_bytes(buf[5..9].try_into().unwrap()),
                 size: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
-                mtime: u64::from_le_bytes(buf[17..25].try_into().unwrap()),
+                atime: u64::from_le_bytes(buf[17..25].try_into().unwrap()),
+                mtime: u64::from_le_bytes(buf[25..33].try_into().unwrap()),
+                ctime: u64::from_le_bytes(buf[33..41].try_into().unwrap()),
             }),
             TAG_EXTENT => {
                 let mut checksum = [0u8; MAX_CKSUM];
@@ -307,6 +331,8 @@ const COMMIT_THRESHOLD_BLOCKS: u64 = 2048;
 pub struct Filesystem<A, D> {
     vol: Volume<FsKey, FsValue, A, D>,
     dirty: u64,
+    /// Current wall-clock time (seconds since epoch), injected by the host.
+    now: u64,
 }
 
 impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
@@ -327,7 +353,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         vol.insert(FsKey::inode(ROOT_INO), FsValue::Inode(Inode::new_dir(0o755)))
             .await?;
         vol.commit().await?;
-        Ok(Self { vol, dirty: 0 })
+        Ok(Self { vol, dirty: 0, now: 0 })
     }
 
     /// Mounts an existing filesystem.
@@ -338,7 +364,44 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         Ok(Self {
             vol: Volume::open(dev, alloc).await?,
             dirty: 0,
+            now: 0,
         })
+    }
+
+    /// Sets the wall-clock used to stamp timestamps (seconds since epoch). The
+    /// host (e.g. the FUSE layer) calls this before mutating operations.
+    pub fn set_time(&mut self, secs: u64) {
+        self.now = secs;
+    }
+
+    /// Sets `ino`'s `atime`/`mtime` (each optional) and `ctime = now` (utimes).
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or I/O.
+    pub async fn set_times(
+        &mut self,
+        ino: u64,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let mut inode = self.read_inode(ino).await?;
+        if let Some(a) = atime {
+            inode.atime = a;
+        }
+        if let Some(m) = mtime {
+            inode.mtime = m;
+        }
+        inode.ctime = self.now;
+        self.write_inode(ino, inode).await?;
+        self.checkpoint(1).await
+    }
+
+    /// Bumps `ino`'s `mtime`/`ctime` to now (a content/metadata change).
+    async fn bump_times(&mut self, ino: u64) -> Result<(), StorageError> {
+        let mut inode = self.read_inode(ino).await?;
+        inode.mtime = self.now;
+        inode.ctime = self.now;
+        self.write_inode(ino, inode).await
     }
 
     /// Records `blocks` worth of change and commits if the batch is large enough.
@@ -475,11 +538,13 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_dir(mode)).await?;
+        self.write_inode(ino, Inode::new_dir(mode).stamped(self.now)).await?;
         self.link(parent, name, ino).await?;
-        // Parent gains a link from the child's "..".
+        // Parent gains a link from the child's "..", and its contents changed.
         let mut p = self.read_inode(parent).await?;
         p.nlink += 1;
+        p.mtime = self.now;
+        p.ctime = self.now;
         self.write_inode(parent, p).await?;
         self.checkpoint(1).await?;
         Ok(ino)
@@ -495,8 +560,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_file(mode)).await?;
+        self.write_inode(ino, Inode::new_file(mode).stamped(self.now)).await?;
         self.link(parent, name, ino).await?;
+        self.bump_times(parent).await?;
         self.checkpoint(1).await?;
         Ok(ino)
     }
@@ -577,6 +643,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     pub async fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<(), StorageError> {
         let child = self.unlink_entry(parent, name).await?;
         self.drop_link(child).await?;
+        self.bump_times(parent).await?;
         self.checkpoint(1).await
     }
 
@@ -629,6 +696,10 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             self.adjust_nlink(old_parent, -1).await?;
             self.adjust_nlink(new_parent, 1).await?;
         }
+        self.bump_times(old_parent).await?;
+        if new_parent != old_parent {
+            self.bump_times(new_parent).await?;
+        }
         self.checkpoint(1).await
     }
 
@@ -645,6 +716,8 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         self.vol.delete(&FsKey::inode(dir)).await?;
         let mut p = self.read_inode(parent).await?;
         p.nlink = p.nlink.saturating_sub(1);
+        p.mtime = self.now;
+        p.ctime = self.now;
         self.write_inode(parent, p).await?;
         self.checkpoint(1).await
     }
@@ -693,6 +766,8 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         if end > inode.size {
             inode.size = end;
         }
+        inode.mtime = self.now;
+        inode.ctime = self.now;
         self.write_inode(ino, inode).await?;
         let blocks = (data.len() / bs) as u64 + 1;
         self.checkpoint(blocks).await
@@ -775,6 +850,8 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         }
 
         inode.size = size;
+        inode.mtime = self.now;
+        inode.ctime = self.now;
         self.write_inode(ino, inode).await?;
         self.checkpoint(1).await
     }
@@ -788,9 +865,10 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             return Err(StorageError::NotADirectory);
         }
         let ino = self.alloc_ino().await?;
-        self.write_inode(ino, Inode::new_symlink()).await?;
+        self.write_inode(ino, Inode::new_symlink().stamped(self.now)).await?;
         self.write(ino, 0, target).await?; // store target as the link's data
         self.link(parent, name, ino).await?;
+        self.bump_times(parent).await?;
         self.checkpoint(1).await?;
         Ok(ino)
     }
@@ -819,7 +897,9 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         }
         self.link(parent, name, target).await?;
         inode.nlink += 1;
+        inode.ctime = self.now;
         self.write_inode(target, inode).await?;
+        self.bump_times(parent).await?;
         self.checkpoint(1).await
     }
 
@@ -1014,6 +1094,27 @@ mod tests {
             block_on(fs.hard_link(ROOT_INO, b"e", d)),
             Err(StorageError::NotPermitted)
         ));
+    }
+
+    #[test]
+    fn timestamps_track_operations() {
+        let mut fs = fresh();
+        fs.set_time(1000);
+        let f = block_on(fs.create(ROOT_INO, b"a", 0o644)).unwrap();
+        let i = block_on(fs.getattr(f)).unwrap();
+        assert_eq!((i.atime, i.mtime, i.ctime), (1000, 1000, 1000), "new file stamped");
+        assert_eq!(block_on(fs.getattr(ROOT_INO)).unwrap().mtime, 1000, "parent mtime bumped");
+
+        fs.set_time(2000);
+        block_on(fs.write(f, 0, b"x")).unwrap();
+        let i2 = block_on(fs.getattr(f)).unwrap();
+        assert_eq!(i2.mtime, 2000, "write bumps mtime");
+        assert_eq!(i2.atime, 1000, "write leaves atime");
+
+        fs.set_time(3000);
+        block_on(fs.set_times(f, Some(500), Some(600))).unwrap();
+        let i3 = block_on(fs.getattr(f)).unwrap();
+        assert_eq!((i3.atime, i3.mtime, i3.ctime), (500, 600, 3000), "utimes sets a/mtime, ctime=now");
     }
 
     #[test]
