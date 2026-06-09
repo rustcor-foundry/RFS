@@ -129,8 +129,13 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
   - [x] ZIL (`zil.rs`): reserved-ring intent log; `sync_insert`/`sync_delete`
     durable immediately, replayed on mount; full ring forces a commit.
   - [ ] Power-cut fuzzing through the whole stack, including the ZIL tail (M6).
-- [ ] **M5 — `rfs-feox` adapter**: bridge `feox-nvme` async queues to
+- [~] **M5 — `rfs-feox` adapter**: bridge `feox-nvme` async queues to
   `BlockDevice`, capability-revocation aware.
+  - [x] Design + gap analysis (`docs/FEOX-INTEGRATION.md`): the seam already fits
+    (async/`!Send`/capability/registered-buffer); the async future maps 1:1.
+  - [ ] **Blocked on `feox-nvme`** growing a data path: command payload on
+    `submit` (opcode/lba/buffer), SQE+doorbell, CQ processing, DMA buffers,
+    namespace identify. Today it is inflight-tracking only. Adapter lands after.
 - [x] **M6 — crash-recovery fuzzing + FUSE testbed**:
   - [x] Model-checked crash-recovery driver (`testkit::fuzz_crash_recovery`),
     deterministic simulation test, and a `cargo fuzz` target (`fuzz/`).
