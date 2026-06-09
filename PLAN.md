@@ -7,10 +7,10 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**62 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+**63 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
 bare-metal RISC-V build green. Mounts via FUSE on Linux (`mkdir`/`write`/`cat`/
-`ls`/`rm`/`mv`/`ln`/`ln -s`/`df`); FS ops batch into the txg (durable on
-`sync`/`fsync`/unmount); passes 150k-op fsx + a 120-file torture pass.**
+`ls -l`/`rm`/`mv`/`ln`/`ln -s`/`df`/`touch`); real timestamps; FS ops batch into
+the txg (durable on `sync`/`fsync`/unmount); passes 150k-op fsx + torture.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -164,7 +164,10 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     (100 mkdirs → <20 device writes vs ~100 before).
   - [x] Phase 2c: `statfs`/`df`, symlinks (`symlink`/`readlink`), hard links
     (`hard_link`) — all verified live on the mount.
-  - [ ] Phase 2d: timestamps (host clock injection), `fsx`/xfstests in CI.
+  - [x] Phase 2d: timestamps — `atime`/`mtime`/`ctime` on inodes, host clock via
+    `set_time`, stamped on create/write/dir-change, `set_times` for utimes;
+    FUSE reports them and handles `touch`. Verified live (`ls -l`/`stat`/`touch`).
+  - [ ] Phase 2e: `fsx`/xfstests in CI; richer ops (xattrs) if needed.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine

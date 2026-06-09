@@ -19,8 +19,8 @@ decoupled so a bug in one cannot silently corrupt another.
 > makes `fsync`-style writes survive a crash. A randomized, model-checked
 > crash-recovery simulation hammers the whole stack with power-cuts and torn
 > commits. A **POSIX-style filesystem** (inodes, directories, paths, and files
-> with checksummed extent data, symlinks, hard links, rename, and `statfs`) runs
-> on top, and it **mounts on Linux via FUSE** as a real directory — verified with
+> with checksummed extent data, symlinks, hard links, rename, timestamps, and
+> `statfs`) runs on top, and it **mounts on Linux via FUSE** as a real directory — verified with
 > `mkdir`/`cat`/`mv`/`ln`/`df`, a 150k-op fsx run, and persistence across remount.
 > *(2026-06-08: 62 passing tests, clippy-pedantic clean, bare-metal RISC-V build
 > green.)*
