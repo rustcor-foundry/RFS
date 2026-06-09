@@ -49,6 +49,8 @@ pub enum StorageError {
     NotADirectory,
     /// A directory operation requires the directory to be empty.
     NotEmpty,
+    /// The operation is not permitted (e.g. hard-linking a directory).
+    NotPermitted,
     /// Stored state failed structural validation.
     Corrupt(CorruptKind),
 }

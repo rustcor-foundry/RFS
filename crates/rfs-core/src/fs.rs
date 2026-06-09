@@ -42,6 +42,8 @@ const S_IFMT: u32 = 0o17_0000;
 pub const S_IFDIR: u32 = 0o04_0000;
 /// Regular-file type bit.
 pub const S_IFREG: u32 = 0o10_0000;
+/// Symbolic-link type bit.
+pub const S_IFLNK: u32 = 0o12_0000;
 
 /// Composite key: items for one object are contiguous, ordered by `kind` then
 /// `k2`.
@@ -133,10 +135,27 @@ impl Inode {
         }
     }
 
+    /// A fresh symbolic link (target stored as its data).
+    #[must_use]
+    pub fn new_symlink() -> Self {
+        Self {
+            mode: S_IFLNK | 0o777,
+            nlink: 1,
+            size: 0,
+            mtime: 0,
+        }
+    }
+
     /// Whether this inode is a directory.
     #[must_use]
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
+    }
+
+    /// Whether this inode is a symbolic link.
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
     }
 }
 
@@ -759,6 +778,57 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         self.write_inode(ino, inode).await?;
         self.checkpoint(1).await
     }
+
+    /// Creates a symbolic link `name` in `parent` pointing at `target` bytes.
+    ///
+    /// # Errors
+    /// [`StorageError::AlreadyExists`], [`StorageError::NotADirectory`], or I/O.
+    pub async fn symlink(&mut self, parent: u64, name: &[u8], target: &[u8]) -> Result<u64, StorageError> {
+        if !self.read_inode(parent).await?.is_dir() {
+            return Err(StorageError::NotADirectory);
+        }
+        let ino = self.alloc_ino().await?;
+        self.write_inode(ino, Inode::new_symlink()).await?;
+        self.write(ino, 0, target).await?; // store target as the link's data
+        self.link(parent, name, ino).await?;
+        self.checkpoint(1).await?;
+        Ok(ino)
+    }
+
+    /// Reads a symbolic link's target.
+    ///
+    /// # Errors
+    /// [`StorageError::NotPermitted`] if `ino` is not a symlink, or I/O.
+    pub async fn readlink(&mut self, ino: u64) -> Result<Vec<u8>, StorageError> {
+        let inode = self.read_inode(ino).await?;
+        if !inode.is_symlink() {
+            return Err(StorageError::NotPermitted);
+        }
+        self.read(ino, 0, usize::try_from(inode.size).unwrap_or(usize::MAX)).await
+    }
+
+    /// Creates a hard link `name` in `parent` to the existing file `target`.
+    ///
+    /// # Errors
+    /// [`StorageError::NotPermitted`] (linking a directory),
+    /// [`StorageError::AlreadyExists`], or I/O.
+    pub async fn hard_link(&mut self, parent: u64, name: &[u8], target: u64) -> Result<(), StorageError> {
+        let mut inode = self.read_inode(target).await?;
+        if inode.is_dir() {
+            return Err(StorageError::NotPermitted);
+        }
+        self.link(parent, name, target).await?;
+        inode.nlink += 1;
+        self.write_inode(target, inode).await?;
+        self.checkpoint(1).await
+    }
+
+    /// `(block_size, total_blocks, free_blocks)` for `statfs`/`df`.
+    #[must_use]
+    pub fn statfs(&self) -> (usize, u64, u64) {
+        let (total, free) = self.vol.space();
+        (self.vol.block_size(), total, free)
+    }
 }
 
 #[cfg(test)]
@@ -906,6 +976,57 @@ mod tests {
         // Grow back: the gap is a hole (zeros), not the old data.
         block_on(fs.truncate(f, 10)).unwrap();
         assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn symlink_roundtrip() {
+        let mut fs = fresh();
+        let s = block_on(fs.symlink(ROOT_INO, b"link", b"/some/where/target")).unwrap();
+        assert!(block_on(fs.getattr(s)).unwrap().is_symlink());
+        assert_eq!(block_on(fs.readlink(s)).unwrap(), b"/some/where/target");
+        let f = block_on(fs.create(ROOT_INO, b"f", 0o644)).unwrap();
+        assert!(matches!(block_on(fs.readlink(f)), Err(StorageError::NotPermitted)));
+    }
+
+    #[test]
+    fn hard_link_shares_inode() {
+        let mut fs = fresh();
+        let a = block_on(fs.create(ROOT_INO, b"a", 0o644)).unwrap();
+        block_on(fs.write(a, 0, b"shared")).unwrap();
+        block_on(fs.hard_link(ROOT_INO, b"b", a)).unwrap();
+
+        let b = block_on(fs.lookup(ROOT_INO, b"b")).unwrap().unwrap();
+        assert_eq!(b, a, "hard link shares the inode");
+        assert_eq!(block_on(fs.getattr(a)).unwrap().nlink, 2);
+
+        // A write via one name is visible via the other.
+        block_on(fs.write(a, 0, b"UPDATED")).unwrap();
+        assert_eq!(block_on(fs.read(b, 0, 100)).unwrap(), b"UPDATED");
+
+        // Unlinking one name keeps the inode (nlink drops to 1).
+        block_on(fs.unlink(ROOT_INO, b"a")).unwrap();
+        assert_eq!(block_on(fs.getattr(b)).unwrap().nlink, 1);
+        assert_eq!(block_on(fs.read(b, 0, 100)).unwrap(), b"UPDATED");
+
+        // Directories cannot be hard-linked.
+        let d = block_on(fs.mkdir(ROOT_INO, b"d", 0o755)).unwrap();
+        assert!(matches!(
+            block_on(fs.hard_link(ROOT_INO, b"e", d)),
+            Err(StorageError::NotPermitted)
+        ));
+    }
+
+    #[test]
+    fn statfs_reports_and_tracks_space() {
+        let mut fs = fresh();
+        let (bs, total, free0) = fs.statfs();
+        assert_eq!(bs, 4096);
+        assert!(total > 0 && free0 > 0 && free0 <= total);
+
+        let f = block_on(fs.create(ROOT_INO, b"big", 0o644)).unwrap();
+        block_on(fs.write(f, 0, &alloc::vec![1u8; 2_000_000])).unwrap();
+        let (_, _, free1) = fs.statfs();
+        assert!(free1 < free0, "writing ~2 MiB should reduce free space: {free0} -> {free1}");
     }
 
     #[test]

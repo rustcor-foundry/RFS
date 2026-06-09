@@ -7,10 +7,10 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**59 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+**62 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
 bare-metal RISC-V build green. Mounts via FUSE on Linux (`mkdir`/`write`/`cat`/
-`ls`/`rm`/`mv`); survives a torture pass (120 varied-size files, checksums match
-across remount). FS ops batch into the txg (durable on `sync`/`fsync`/unmount).**
+`ls`/`rm`/`mv`/`ln`/`ln -s`/`df`); FS ops batch into the txg (durable on
+`sync`/`fsync`/unmount); passes 150k-op fsx + a 120-file torture pass.**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
@@ -162,7 +162,9 @@ Next after that: M4 (txg + ZIL), M5 (feox adapter), M6 (FUSE + fuzz), M7 (VFS).
     reads see uncommitted state) and flush at a block threshold or on
     `sync`/`fsync`/`flush`/unmount — many ops now coalesce into one commit
     (100 mkdirs → <20 device writes vs ~100 before).
-  - [ ] Phase 2c: timestamps (host clock), statfs/df, symlinks/hardlinks.
+  - [x] Phase 2c: `statfs`/`df`, symlinks (`symlink`/`readlink`), hard links
+    (`hard_link`) — all verified live on the mount.
+  - [ ] Phase 2d: timestamps (host clock injection), `fsx`/xfstests in CI.
 - [ ] **M8 — CSI driver** on the std/FUSE build: provision/attach/mount/expand,
   VolumeSnapshot → CoW snapshots, topology-aware (`WaitForFirstConsumer`).
 - [ ] **M9 — Replicated `BlockDevice`**: network RAID-1 below the engine

@@ -11,12 +11,13 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem as FuseFs, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request,
 };
 
 use rfs_core::allocator::{SegmentAllocator, SegmentGeom};
@@ -89,6 +90,7 @@ fn errno(err: &StorageError) -> i32 {
         StorageError::AlreadyExists => libc::EEXIST,
         StorageError::NotADirectory => libc::ENOTDIR,
         StorageError::NotEmpty => libc::ENOTEMPTY,
+        StorageError::NotPermitted => libc::EPERM,
         _ => libc::EIO,
     }
 }
@@ -103,6 +105,8 @@ impl Adapter {
     fn attr(&self, ino: u64, inode: &Inode) -> FileAttr {
         let kind = if inode.is_dir() {
             FileType::Directory
+        } else if inode.is_symlink() {
+            FileType::Symlink
         } else {
             FileType::RegularFile
         };
@@ -305,6 +309,55 @@ impl FuseFs for Adapter {
 
     fn destroy(&mut self) {
         let _ = block_on(self.fs.sync()); // flush on unmount
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let (bsize, total, free) = self.fs.statfs();
+        let bsize = bsize as u32;
+        // blocks, bfree, bavail, files, ffree, bsize, namelen, frsize
+        reply.statfs(total, free, free, 0, free, bsize, 255, bsize);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
+        reply: ReplyEntry,
+    ) {
+        let target = link.as_os_str().as_bytes();
+        match block_on(self.fs.symlink(parent, name.as_bytes(), target)) {
+            Ok(ino) => match block_on(self.fs.getattr(ino)) {
+                Ok(inode) => reply.entry(&TTL, &self.attr(ino, &inode), 0),
+                Err(e) => reply.error(errno(&e)),
+            },
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        match block_on(self.fs.readlink(ino)) {
+            Ok(target) => reply.data(&target),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        match block_on(self.fs.hard_link(newparent, newname.as_bytes(), ino)) {
+            Ok(()) => match block_on(self.fs.getattr(ino)) {
+                Ok(inode) => reply.entry(&TTL, &self.attr(ino, &inode), 0),
+                Err(e) => reply.error(errno(&e)),
+            },
+            Err(e) => reply.error(errno(&e)),
+        }
     }
 
     fn readdir(
