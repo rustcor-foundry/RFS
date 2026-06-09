@@ -1,7 +1,8 @@
 name: Release packages
 
 # On a version tag, build the rfs-fuse Debian (.deb) and RPM (.rpm) packages for
-# Debian/SUSE and attach them as workflow artifacts.
+# Debian/SUSE, publish a Gitea release for the tag, and attach the packages as
+# downloadable release assets (also kept as a workflow artifact as a fallback).
 on:
   push:
     tags: ["v*"]
@@ -40,8 +41,65 @@ jobs:
           cp target/generate-rpm/*.rpm dist/
           ls -l dist
 
-      - name: Upload packages
+      - name: Upload packages (workflow artifact)
         uses: actions/upload-artifact@v3
         with:
           name: rfs-fuse-packages
           path: dist/*
+
+      # Create the Gitea release for this tag (or reuse it if it already exists)
+      # and attach the built packages as assets. Idempotent: re-running the
+      # workflow replaces same-named assets instead of erroring.
+      - name: Publish Gitea release and attach packages
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          TAG="${GITHUB_REF_NAME}"
+          hdr=(-H "Authorization: token ${GITEA_TOKEN}")
+
+          rid="$(curl -fsS "${hdr[@]}" "$API/releases/tags/$TAG" 2>/dev/null | jq -r '.id // empty' || true)"
+          if [ -z "$rid" ]; then
+            printf '%s\n' \
+              "Automated release built from tag \`$TAG\` by CI." \
+              "" \
+              "## Install" \
+              "**Debian / Ubuntu** (\`Depends: fuse3, libc6\`):" \
+              '```' \
+              "sudo apt install ./rfs-fuse_*_amd64.deb" \
+              '```' \
+              "**openSUSE / Fedora / RHEL** (\`Requires: fuse3\`):" \
+              '```' \
+              "sudo zypper install ./rfs-fuse-*.x86_64.rpm" \
+              '```' \
+              "" \
+              "## Usage" \
+              '```' \
+              "rfs-fuse /var/lib/rfs/data.img /mnt/rfs   # creates + formats if empty" \
+              "fusermount3 -u /mnt/rfs" \
+              '```' \
+              "" \
+              "Dual-licensed MIT OR Apache-2.0." > body.md
+            rid="$(jq -n --arg t "$TAG" --arg n "RFS $TAG" --rawfile b body.md \
+                     '{tag_name:$t, name:$n, body:$b}' \
+                   | curl -fsS "${hdr[@]}" -H 'Content-Type: application/json' \
+                          -X POST "$API/releases" -d @- | jq -r '.id')"
+            echo "Created release $TAG (id $rid)"
+          else
+            echo "Reusing existing release $TAG (id $rid)"
+          fi
+
+          for f in dist/*.deb dist/*.rpm; do
+            [ -e "$f" ] || continue
+            name="$(basename "$f")"
+            for aid in $(curl -fsS "${hdr[@]}" "$API/releases/$rid/assets" \
+                          | jq -r --arg n "$name" '.[] | select(.name==$n) | .id'); do
+              echo "Replacing existing asset $name (id $aid)"
+              curl -fsS "${hdr[@]}" -X DELETE "$API/releases/$rid/assets/$aid"
+            done
+            echo "Uploading $name"
+            curl -fsS "${hdr[@]}" -F "attachment=@$f" "$API/releases/$rid/assets?name=$name" >/dev/null
+          done
+          echo "Release ready: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/$TAG"
