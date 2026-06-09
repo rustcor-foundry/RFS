@@ -1,0 +1,54 @@
+name: Release packages
+
+# On a version tag, build the rfs-fuse Debian (.deb) and RPM (.rpm) packages for
+# Debian/SUSE and attach them as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Build .deb and .rpm
+    runs-on: lx-ws01
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps (Debian/SUSE)
+        shell: bash
+        run: |
+          if command -v zypper >/dev/null; then
+            sudo zypper --non-interactive install -y fuse3-devel pkgconf-pkg-config gcc
+          elif command -v apt-get >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config gcc
+          fi
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build .deb
+        run: cargo deb --manifest-path rfs-fuse/Cargo.toml
+
+      - name: Build .rpm
+        shell: bash
+        run: |
+          cargo build --release --manifest-path rfs-fuse/Cargo.toml
+          cargo generate-rpm -p rfs-fuse
+
+      - name: Collect packages
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp rfs-fuse/target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          ls -l dist
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v3
+        with:
+          name: rfs-fuse-packages
+          path: dist/*

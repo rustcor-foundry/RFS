@@ -6,8 +6,50 @@ name = "rfs-fuse"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "Mount an RFS copy-on-write filesystem image via FUSE"
+license = "MIT OR Apache-2.0"
+authors = ["RFS Contributors"]
+homepage = "https://gitea.w-sky.net/rustcor/RFS"
+repository = "https://gitea.w-sky.net/rustcor/RFS"
 
 [dependencies]
 rfs-core = { path = "../crates/rfs-core" }
 fuser = "0.14"
 libc = "0.2"
+
+# --- Debian package (cargo-deb) ------------------------------------------------
+[package.metadata.deb]
+maintainer = "RFS Contributors <paul@w-sky.net>"
+copyright = "2026, RFS Contributors. Dual-licensed MIT OR Apache-2.0."
+license-file = ["../LICENSE", "0"]
+section = "admin"
+priority = "optional"
+# Auto-detect the libfuse3 runtime via dpkg-shlibdeps so the right package name
+# is used per release (libfuse3-3 on Debian 12, libfuse3-4 on Debian 13+).
+depends = "$auto"
+extended-description = """
+RFS is a copy-on-write, log-structured, self-healing filesystem. rfs-fuse mounts
+an RFS image as a directory via FUSE, with snapshots, checksummed data, and
+atomic crash-safe commits."""
+assets = [
+    ["target/release/rfs-fuse", "usr/bin/", "755"],
+    ["rfs-fuse.1", "usr/share/man/man1/rfs-fuse.1", "644"],
+    ["../README.md", "usr/share/doc/rfs-fuse/README.md", "644"],
+]
+
+# --- RPM package (cargo-generate-rpm) -----------------------------------------
+[package.metadata.generate-rpm]
+summary = "Mount an RFS copy-on-write filesystem image via FUSE"
+license = "MIT OR Apache-2.0"
+assets = [
+    { source = "target/release/rfs-fuse", dest = "/usr/bin/rfs-fuse", mode = "755" },
+    { source = "rfs-fuse.1", dest = "/usr/share/man/man1/rfs-fuse.1", mode = "644" },
+    { source = "../README.md", dest = "/usr/share/doc/rfs-fuse/README.md", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+fuse3 = "*"
+
+[[bin]]
+name = "rfs-fuse"
+path = "src/main.rs"
