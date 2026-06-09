@@ -20,6 +20,12 @@ rfs-core = { path = "../crates/rfs-core" }
 fuser = { version = "0.14", default-features = false }
 libc = "0.2"
 
+[features]
+# Enables the rfs-bench engine micro-benchmark, which needs rfs-core's in-memory
+# testkit device. Off by default so it never affects the shipped rfs-fuse binary
+# or the .deb/.rpm packaging.
+bench = ["rfs-core/testkit"]
+
 # --- Debian package (cargo-deb) ------------------------------------------------
 [package.metadata.deb]
 maintainer = "RFS Contributors <paul@example.com>"
@@ -57,3 +63,8 @@ fuse3 = "*"
 [[bin]]
 name = "rfs-fuse"
 path = "src/main.rs"
+
+[[bin]]
+name = "rfs-bench"
+path = "src/bin/rfs-bench.rs"
+required-features = ["bench"]

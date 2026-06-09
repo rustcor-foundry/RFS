@@ -460,9 +460,15 @@ fn main() {
         .open(&image)
         .expect("open image");
 
-    // Size a new image to 64 MiB.
+    // Size a new image; default 64 MiB, overridable via RFS_IMAGE_MB (used by
+    // benchmarks that need a multi-GiB volume).
     if !existing {
-        file.set_len(64 * 1024 * 1024).expect("size image");
+        let mb: u64 = std::env::var("RFS_IMAGE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(64);
+        file.set_len(mb * 1024 * 1024).expect("size image");
     }
     let blocks = file.metadata().expect("stat image").len() / BLOCK_SIZE as u64;
     let dev = FileDevice { file, blocks };
