@@ -106,6 +106,26 @@ impl<K: Key, V: Value> Txg<K, V> {
         }
     }
 
+    /// Collects `[start, end)` from the open transaction (uncommitted changes
+    /// over the on-disk base), ascending, into `out`.
+    ///
+    /// # Errors
+    /// Device or verification errors.
+    pub async fn range<D: BlockDevice>(
+        &self,
+        start: K,
+        end: K,
+        dev: &D,
+        pool: &mut BufferPool,
+        hasher: Hasher,
+        out: &mut Vec<(K, V)>,
+    ) -> Result<(), StorageError> {
+        if let Some(slot) = &self.root {
+            range_slot::<K, V, D>(slot, &start, &end, dev, pool, hasher, out).await?;
+        }
+        Ok(())
+    }
+
     /// Inserts or updates `key => val` in the open transaction.
     ///
     /// # Errors
@@ -236,6 +256,96 @@ fn fault_in<'f, K: Key, V: Value, D: BlockDevice>(
         };
         *slot = Slot::Mem(Box::new(dnode));
         freed.push(ptr);
+        Ok(())
+    })
+}
+
+/// Range traversal over a shadow slot (`Mem` in memory, `Disk` via the device).
+fn range_slot<'f, K: Key, V: Value, D: BlockDevice>(
+    slot: &'f Slot<K, V>,
+    start: &'f K,
+    end: &'f K,
+    dev: &'f D,
+    pool: &'f mut BufferPool,
+    hasher: Hasher,
+    out: &'f mut Vec<(K, V)>,
+) -> Fut<'f, ()> {
+    Box::pin(async move {
+        match slot {
+            Slot::Disk(ptr) => range_disk::<K, V, D>(*ptr, start, end, dev, pool, hasher, out).await,
+            Slot::Mem(node) => match &**node {
+                DNode::Leaf(entries) => {
+                    for (k, v) in entries {
+                        if *k >= *start && *k < *end {
+                            out.push((*k, v.clone()));
+                        }
+                    }
+                    Ok(())
+                }
+                DNode::Internal { keys, kids, .. } => {
+                    let n = keys.len();
+                    for i in 0..=n {
+                        let below_end = i == 0 || keys[i - 1] < *end;
+                        let above_start = i == n || *start < keys[i];
+                        if below_end && above_start {
+                            range_slot::<K, V, D>(
+                                &kids[i],
+                                start,
+                                end,
+                                dev,
+                                &mut *pool,
+                                hasher,
+                                &mut *out,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                }
+            },
+        }
+    })
+}
+
+/// Range traversal over an on-disk subtree (clean part of the shadow).
+fn range_disk<'f, K: Key, V: Value, D: BlockDevice>(
+    ptr: BlockPtr,
+    start: &'f K,
+    end: &'f K,
+    dev: &'f D,
+    pool: &'f mut BufferPool,
+    hasher: Hasher,
+    out: &'f mut Vec<(K, V)>,
+) -> Fut<'f, ()> {
+    Box::pin(async move {
+        match read_node::<K, V, D>(&ptr, dev, pool, hasher).await? {
+            Node::Leaf(leaf) => {
+                for (k, v) in leaf.entries {
+                    if k >= *start && k < *end {
+                        out.push((k, v));
+                    }
+                }
+            }
+            Node::Internal(node) => {
+                let n = node.keys.len();
+                for i in 0..=n {
+                    let below_end = i == 0 || node.keys[i - 1] < *end;
+                    let above_start = i == n || *start < node.keys[i];
+                    if below_end && above_start {
+                        range_disk::<K, V, D>(
+                            node.children[i],
+                            start,
+                            end,
+                            dev,
+                            &mut *pool,
+                            hasher,
+                            &mut *out,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
         Ok(())
     })
 }

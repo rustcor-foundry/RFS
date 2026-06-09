@@ -274,9 +274,20 @@ fn name_hash(name: &[u8]) -> u64 {
     h
 }
 
+/// Commit once this many blocks of changes have accumulated in the open txg,
+/// bounding RAM/space while letting many operations coalesce into one commit.
+const COMMIT_THRESHOLD_BLOCKS: u64 = 2048;
+
 /// A mounted filesystem: a directory namespace over a [`Volume`].
+///
+/// Operations accumulate in the open transaction and are flushed lazily (at the
+/// threshold, or on [`sync`](Filesystem::sync)) so many small ops coalesce into
+/// one commit. Durability is explicit: call `sync` (the FUSE layer does so on
+/// `fsync`/`flush`/unmount) — unsynced changes may be lost on a crash, as POSIX
+/// allows.
 pub struct Filesystem<A, D> {
     vol: Volume<FsKey, FsValue, A, D>,
+    dirty: u64,
 }
 
 impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
@@ -297,7 +308,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         vol.insert(FsKey::inode(ROOT_INO), FsValue::Inode(Inode::new_dir(0o755)))
             .await?;
         vol.commit().await?;
-        Ok(Self { vol })
+        Ok(Self { vol, dirty: 0 })
     }
 
     /// Mounts an existing filesystem.
@@ -307,7 +318,30 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     pub async fn open(dev: D, alloc: A) -> Result<Self, StorageError> {
         Ok(Self {
             vol: Volume::open(dev, alloc).await?,
+            dirty: 0,
         })
+    }
+
+    /// Records `blocks` worth of change and commits if the batch is large enough.
+    async fn checkpoint(&mut self, blocks: u64) -> Result<(), StorageError> {
+        self.dirty += blocks;
+        if self.dirty >= COMMIT_THRESHOLD_BLOCKS {
+            self.vol.commit().await?;
+            self.dirty = 0;
+        }
+        Ok(())
+    }
+
+    /// Flushes all pending changes to stable storage (the durability barrier).
+    ///
+    /// # Errors
+    /// Device errors.
+    pub async fn sync(&mut self) -> Result<(), StorageError> {
+        if self.dirty > 0 {
+            self.vol.commit().await?;
+            self.dirty = 0;
+        }
+        Ok(())
     }
 
     /// Borrows the backing device (tests / fault injection).
@@ -428,7 +462,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         let mut p = self.read_inode(parent).await?;
         p.nlink += 1;
         self.write_inode(parent, p).await?;
-        self.vol.commit().await?;
+        self.checkpoint(1).await?;
         Ok(ino)
     }
 
@@ -444,7 +478,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         let ino = self.alloc_ino().await?;
         self.write_inode(ino, Inode::new_file(mode)).await?;
         self.link(parent, name, ino).await?;
-        self.vol.commit().await?;
+        self.checkpoint(1).await?;
         Ok(ino)
     }
 
@@ -524,7 +558,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
     pub async fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<(), StorageError> {
         let child = self.unlink_entry(parent, name).await?;
         self.drop_link(child).await?;
-        self.vol.commit().await
+        self.checkpoint(1).await
     }
 
     /// Renames `(old_parent, old_name)` to `(new_parent, new_name)`, replacing an
@@ -576,7 +610,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             self.adjust_nlink(old_parent, -1).await?;
             self.adjust_nlink(new_parent, 1).await?;
         }
-        self.vol.commit().await
+        self.checkpoint(1).await
     }
 
     /// Removes an empty subdirectory `name` from `parent`.
@@ -593,7 +627,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
         let mut p = self.read_inode(parent).await?;
         p.nlink = p.nlink.saturating_sub(1);
         self.write_inode(parent, p).await?;
-        self.vol.commit().await
+        self.checkpoint(1).await
     }
 
     async fn get_extent(&mut self, ino: u64, block_off: u64) -> Result<Option<BlockPtr>, StorageError> {
@@ -641,7 +675,8 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
             inode.size = end;
         }
         self.write_inode(ino, inode).await?;
-        self.vol.commit().await
+        let blocks = (data.len() / bs) as u64 + 1;
+        self.checkpoint(blocks).await
     }
 
     /// Reads up to `len` bytes from byte `offset` of file `ino`. Bytes past EOF
@@ -722,7 +757,7 @@ impl<A: Allocator, D: BlockDevice> Filesystem<A, D> {
 
         inode.size = size;
         self.write_inode(ino, inode).await?;
-        self.vol.commit().await
+        self.checkpoint(1).await
     }
 }
 
@@ -808,6 +843,7 @@ mod tests {
             docs = block_on(fs.mkdir(ROOT_INO, b"docs", 0o755)).unwrap();
             block_on(fs.create(docs, b"a", 0o644)).unwrap();
             block_on(fs.create(docs, b"b", 0o644)).unwrap();
+            block_on(fs.sync()).unwrap();
             media = fs.device().snapshot();
         }
         let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
@@ -847,6 +883,7 @@ mod tests {
             f = block_on(fs.create(ROOT_INO, b"big", 0o644)).unwrap();
             let blob: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
             block_on(fs.write(f, 0, &blob)).unwrap();
+            block_on(fs.sync()).unwrap();
             media = fs.device().snapshot();
         }
         let mut fs: Fs = block_on(Filesystem::open(media, alloc())).unwrap();
@@ -869,6 +906,25 @@ mod tests {
         // Grow back: the gap is a hole (zeros), not the old data.
         block_on(fs.truncate(f, 10)).unwrap();
         assert_eq!(block_on(fs.read(f, 0, 100)).unwrap(), [7, 7, 7, 7, 7, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn metadata_ops_batch_until_sync() {
+        let mut fs = fresh();
+        let before = fs.device().write_count();
+        for i in 0..100u64 {
+            let name = alloc::format!("d{i}");
+            block_on(fs.mkdir(ROOT_INO, name.as_bytes(), 0o755)).unwrap();
+        }
+        // No sync yet: everything is still in the in-memory txg shadow, so the
+        // 100 mkdirs caused (almost) no device writes — they coalesce.
+        let during = fs.device().write_count() - before;
+        assert!(during < 20, "expected batching, got {during} device writes for 100 mkdirs");
+
+        block_on(fs.sync()).unwrap();
+        assert!(fs.device().write_count() > before, "sync must flush to device");
+        // And all 100 are durable + visible.
+        assert_eq!(block_on(fs.readdir(ROOT_INO)).unwrap().len(), 100);
     }
 
     #[test]
@@ -954,6 +1010,7 @@ mod tests {
                 let byte = u8::try_from(i % 251).unwrap();
                 block_on(fs.write(f, 0, &alloc::vec![byte; len])).unwrap();
             }
+            block_on(fs.sync()).unwrap();
             media = fs.device().snapshot();
         }
 
