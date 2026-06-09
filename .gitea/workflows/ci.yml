@@ -42,14 +42,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libfuse3 (Debian/SUSE)
-        shell: bash
-        run: |
-          if command -v zypper >/dev/null; then
-            sudo zypper --non-interactive install -y fuse3-devel pkgconf-pkg-config gcc
-          elif command -v apt-get >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config gcc
-          fi
-
+      # rfs-fuse builds fuser with default-features = false, so there is no C
+      # libfuse link step — no libfuse3-dev / system packages are required to
+      # build. At runtime it execs fusermount3 (from the fuse3 package).
       - name: Build rfs-fuse (release)
         run: cargo build --release --manifest-path rfs-fuse/Cargo.toml

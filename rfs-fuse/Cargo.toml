@@ -14,7 +14,10 @@ repository = "https://github.com/rustcor-foundry/RFS"
 
 [dependencies]
 rfs-core = { path = "../crates/rfs-core" }
-fuser = "0.14"
+# default-features = false drops the C libfuse link: fuser mounts via the
+# fusermount3 helper binary instead. No libfuse3-dev needed to build, and the
+# runtime dependency is just the fuse3 package (which ships fusermount3).
+fuser = { version = "0.14", default-features = false }
 libc = "0.2"
 
 # --- Debian package (cargo-deb) ------------------------------------------------
@@ -24,9 +27,10 @@ copyright = "2026, RFS Contributors. Dual-licensed MIT OR Apache-2.0."
 license-file = ["../LICENSE", "0"]
 section = "admin"
 priority = "optional"
-# Auto-detect the libfuse3 runtime via dpkg-shlibdeps so the right package name
-# is used per release (libfuse3-3 on Debian 12, libfuse3-4 on Debian 13+).
-depends = "$auto"
+# $auto picks up libc6 via dpkg-shlibdeps; fuse3 ships the fusermount3 helper
+# that the binary execs to mount (we don't link libfuse, so there's no
+# libfuse3-N dependency to track across Debian releases).
+depends = "$auto, fuse3"
 extended-description = """
 RFS is a copy-on-write, log-structured, self-healing filesystem. rfs-fuse mounts
 an RFS image as a directory via FUSE, with snapshots, checksummed data, and
