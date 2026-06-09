@@ -7,8 +7,9 @@ ISA barely touches the engine — the core compiles bare-metal `no_std` today
 
 ## Progress snapshot — 2026-06-08
 
-**54 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
-bare-metal RISC-V build green.**
+**55 tests passing (incl. crash-recovery simulation) · clippy-pedantic clean ·
+bare-metal RISC-V build green. Mounts via FUSE on Linux and survives a
+torture pass (120 varied-size files, checksums match across remount).**
 
 Done: M1 (superblock ring + atomic commit), M2 (segment allocator), the
 hardware/transport seams (zero-copy buffers, vectored I/O, Zoned/Deallocate/
