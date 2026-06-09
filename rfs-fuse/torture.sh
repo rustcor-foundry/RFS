@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Torture + persistence check for the rfs-fuse mount (run on Linux).
+# Self-builds into a persistent target dir (WSL's /tmp does not survive restarts).
 set -euo pipefail
-BIN=/tmp/rfs-fuse/debug/rfs-fuse
+HERE="$(dirname "$0")"
+export CARGO_TARGET_DIR="$HOME/rfs-wsl-target"
+BIN="$CARGO_TARGET_DIR/debug/rfs-fuse"
 IMG=/tmp/rfs.img
 MNT=/tmp/rfsmnt
+(cd "$HERE" && cargo build) 2>&1 | grep -aE "error|Finished" || true
 
 mount_rfs() {
   nohup "$BIN" "$IMG" "$MNT" >/tmp/rfs-fuse.log 2>&1 &
