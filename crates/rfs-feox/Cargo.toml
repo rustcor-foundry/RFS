@@ -1,0 +1,14 @@
+[package]
+name = "rfs-feox"
+description = "Feox exokernel adapter: rfs-core BlockDevice over feox-nvme queue rings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rfs-core = { path = "../rfs-core" }
+feox-nvme = { git = "https://github.com/rustcor-foundry/Feox.git" }
+
+[lints]
+workspace = true

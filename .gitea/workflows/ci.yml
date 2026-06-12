@@ -26,13 +26,13 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (pedantic, warnings = errors)
-        run: cargo clippy -p rfs-core --all-features -- -D warnings
+        run: cargo clippy -p rfs-core -p rfs-feox --all-features -- -D warnings
 
       - name: Unit tests + crash-recovery simulation
-        run: cargo test -p rfs-core
+        run: cargo test -p rfs-core -p rfs-feox
 
       - name: Bare-metal RISC-V build (no_std)
-        run: cargo build -p rfs-core --target riscv64gc-unknown-none-elf
+        run: cargo build -p rfs-core -p rfs-feox --target riscv64gc-unknown-none-elf
 
   fuse:
     name: FUSE adapter — build on Linux
