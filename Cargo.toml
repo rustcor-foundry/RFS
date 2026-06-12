@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rfs-core"]
+members = ["crates/rfs-core", "crates/rfs-feox"]
 # `fuzz` is a cargo-fuzz package (nightly + Linux/macOS, libFuzzer); kept out of
 # the default build so `cargo build`/`test` stay stable + cross-platform.
 exclude = ["fuzz", "rfs-fuse"]
