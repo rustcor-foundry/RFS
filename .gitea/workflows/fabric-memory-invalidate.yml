@@ -1,0 +1,50 @@
+name: fabric-memory-invalidate
+
+# On every push, invalidate the code-anchored fabric-memory edges anchored to the
+# files that changed — so verification recipes that depended on that code stop
+# being recalled (invalidate, don't discard). Runs on the lx-ai1 host runner,
+# where the edge store lives (~/.conductor/fabric-memory-edges.jsonl); the bin
+# parses the push payload itself, so no checkout/jq is needed.
+#
+# P2c trigger. Direct-hit today; once GitNexus is a fabric service (P2b), the
+# bin can expand changed paths to their dependents before invalidating.
+
+on: [push]
+
+jobs:
+  invalidate:
+    runs-on: lx-ai1
+    steps:
+      - name: Refresh GitNexus index for the pushed repo (re-index on push)
+        # Re-analyze the canonical clone at the pushed commit so blast-radius
+        # reflects current code. eval-server reads the on-disk index per query
+        # (no restart needed). Skips cleanly if no canonical clone exists yet
+        # for this repo (org rollout pre-creates them).
+        env:
+          GITNEXUS_BIN: /opt/node22/bin/gitnexus
+          INDEX_ROOT: /home/rssvc/.fabric/index
+        run: |
+          repo="${{ github.event.repository.name }}"
+          sha="${{ github.event.after }}"
+          dir="$INDEX_ROOT/$repo"
+          if [ ! -d "$dir/.git" ]; then
+            git clone --quiet "${{ github.event.repository.clone_url }}" "$dir" 2>/dev/null || true
+          fi
+          if [ -d "$dir/.git" ]; then
+            git -C "$dir" fetch --quiet origin || true
+            git -C "$dir" checkout --quiet --force "$sha" 2>/dev/null || true
+            "$GITNEXUS_BIN" analyze "$dir" >/dev/null 2>&1 \
+              && echo "re-indexed $repo @ $(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+          else
+            echo "no canonical clone for $repo (clone failed); direct-hit only"
+          fi
+      - name: Invalidate edges for changed files (+ GitNexus blast-radius)
+        # GITNEXUS_URL points at the lx-ai1 gitnexus-eval service, so changed
+        # paths are expanded to their dependents before invalidating. Unset it
+        # to fall back to direct-hit only.
+        env:
+          GITNEXUS_URL: http://127.0.0.1:4848
+        run: |
+          /usr/local/bin/fabric-memory-invalidate \
+            --repo "${{ github.event.repository.name }}" \
+            --gitea-event "$GITHUB_EVENT_PATH"
