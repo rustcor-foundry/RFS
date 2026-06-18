@@ -1,13 +1,18 @@
 name: fabric-memory-invalidate
 
-# On every push, invalidate the code-anchored fabric-memory edges anchored to the
-# files that changed — so verification recipes that depended on that code stop
-# being recalled (invalidate, don't discard). Runs on the lx-ai1 host runner,
+# On every push TO THE DEFAULT BRANCH, invalidate the code-anchored fabric-memory
+# edges anchored to the files that changed — so verification recipes that
+# depended on that code stop being recalled (invalidate, don't discard). Pushes
+# to non-default branches are IGNORED: a feature/throwaway branch must not drop
+# recipes verified against the default branch. Runs on the lx-ai1 host runner,
 # where the edge store lives (~/.conductor/fabric-memory-edges.jsonl); the bin
 # parses the push payload itself, so no checkout/jq is needed.
 #
-# P2c trigger. Direct-hit today; once GitNexus is a fabric service (P2b), the
-# bin can expand changed paths to their dependents before invalidating.
+# Two steps: (1) re-index the pushed repo in GitNexus so blast-radius reflects
+# current code — skipped for repos with no fabric-memory edges yet (nothing to
+# invalidate, so blast-radius isn't needed) — then (2) expand each changed path
+# to its dependents via the lx-ai1 gitnexus-eval service and invalidate edges
+# anchored to that blast radius.
 
 on: [push]
 
@@ -23,10 +28,31 @@ jobs:
         env:
           GITNEXUS_BIN: /opt/node22/bin/gitnexus
           INDEX_ROOT: /home/rssvc/.fabric/index
+          EDGES: /home/rssvc/.conductor/fabric-memory-edges.jsonl
         run: |
+          # Default-branch only: a push to a feature/throwaway branch must not
+          # invalidate recipes verified against the default branch.
+          if [ "${{ github.ref }}" != "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "skip: push to ${{ github.ref }} is not the default branch (${{ github.event.repository.default_branch }})"
+            exit 0
+          fi
           repo="${{ github.event.repository.name }}"
           sha="${{ github.event.after }}"
           dir="$INDEX_ROOT/$repo"
+          # Nothing to invalidate for a repo with no fabric-memory edges yet, so
+          # skip the expensive re-analyze entirely (the dominant CI cost).
+          if [ ! -f "$EDGES" ] || ! grep -q "\"repo\":\"$repo\"" "$EDGES"; then
+            echo "no fabric-memory edges for $repo; skipping re-index"
+            exit 0
+          fi
+          # A few repos carry oversized generated/god-files that crash the native
+          # tree-sitter parser (a concurrent native abort it can't recover from).
+          # Cap per-file size for those so re-index stays stable; others use the
+          # gitnexus defaults. Gravitide: 599MB DXSDK exe + 250KB+ Lua-binding and
+          # god .cpp files; its canonical clone is also blobless+sparse (code only).
+          case "$repo" in
+            Gravitide) export GITNEXUS_MAX_FILE_SIZE=200 ;;
+          esac
           if [ ! -d "$dir/.git" ]; then
             git clone --quiet "${{ github.event.repository.clone_url }}" "$dir" 2>/dev/null || true
           fi
@@ -45,6 +71,11 @@ jobs:
         env:
           GITNEXUS_URL: http://127.0.0.1:4848
         run: |
+          # Default-branch only (mirror of the guard above).
+          if [ "${{ github.ref }}" != "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "skip: push to ${{ github.ref }} is not the default branch (${{ github.event.repository.default_branch }})"
+            exit 0
+          fi
           /usr/local/bin/fabric-memory-invalidate \
             --repo "${{ github.event.repository.name }}" \
             --gitea-event "$GITHUB_EVENT_PATH"
