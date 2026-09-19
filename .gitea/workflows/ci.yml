@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # rfs-feox depends on github.com/rustcor-foundry/Feox via a git URL, which
+  # is private until the public flip. act_runner gives jobs a pty, so without
+  # this git *prompts* for credentials and waits forever -- while cargo holds
+  # the package-cache lock for every other build on lx-ws01. With it, git
+  # fails immediately and the job fails honestly instead.
+  GIT_TERMINAL_PROMPT: "0"
 
 jobs:
   engine:
