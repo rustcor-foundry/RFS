@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  engine:
+    name: engine — fmt, clippy, tests, bare-metal RISC-V
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (+ riscv64 no_std target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (pedantic, warnings = errors)
+        run: cargo clippy -p rfs-core -p rfs-feox --all-features -- -D warnings
+
+      - name: Unit tests + crash-recovery simulation
+        run: cargo test -p rfs-core -p rfs-feox
+
+      # The engine is no_std and is meant to run under Feox on RISC-V. Building
+      # for a bare-metal target is what proves it has not picked up an
+      # accidental dependency on std.
+      - name: Bare-metal RISC-V build (no_std)
+        run: cargo build -p rfs-core -p rfs-feox --target riscv64gc-unknown-none-elf
+
+  fuse:
+    name: FUSE adapter — build on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # rfs-fuse builds fuser with default-features = false, so there is no C
+      # libfuse link step and no system packages are needed to build. At
+      # runtime it execs fusermount3 (from the fuse3 package).
+      #
+      # It is excluded from the workspace, so it needs its own manifest path.
+      - name: Build rfs-fuse (release)
+        run: cargo build --release --manifest-path rfs-fuse/Cargo.toml
