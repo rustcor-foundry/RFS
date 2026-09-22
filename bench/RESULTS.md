@@ -1,7 +1,7 @@
 # RFS baseline benchmarks — RFS vs ZFS (and ext4 floor)
 
-First baseline pass, run 2026-06-09 on **lx-ws01** (Debian 13, kernel 6.12,
-80 cores, 503 GiB RAM, all targets on the same disk `/dev/sdo2`). The goal is a
+First baseline pass, run 2026-06-09 on a **Debian 13 workstation** (kernel
+6.12, 80 cores, 503 GiB RAM, all targets on the same SATA disk). The goal is a
 rough "where are we" picture, not a tuned competitive result.
 
 ## Three layers measured
