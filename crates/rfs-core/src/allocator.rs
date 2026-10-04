@@ -397,9 +397,7 @@ impl Allocator for SegmentAllocator {
                 seg.valid = 0;
             }
         }
-        for word in &mut self.bitmap.words {
-            *word = 0;
-        }
+        self.bitmap.words.fill(0);
         self.active = [None; SegKind::COUNT];
         self.free_segments = self.geom.segment_count - self.geom.reserved_segments;
         self.dirty.clear();

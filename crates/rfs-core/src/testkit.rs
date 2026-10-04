@@ -116,6 +116,11 @@ impl MemDevice {
     }
 }
 
+// These are a deliberately trivial in-memory test double: the media is a
+// Vec, so nothing awaits. clippy::unused_async_trait_impl suggests dropping
+// `async` and returning `impl Future` instead, which would satisfy the lint
+// but make a fake device read less like the real driver it stands in for.
+#[allow(clippy::unused_async_trait_impl)]
 impl BlockDevice for MemDevice {
     fn block_size(&self) -> usize {
         self.block_size
@@ -173,6 +178,11 @@ impl BlockDevice for MemDevice {
     }
 }
 
+// These are a deliberately trivial in-memory test double: the media is a
+// Vec, so nothing awaits. clippy::unused_async_trait_impl suggests dropping
+// `async` and returning `impl Future` instead, which would satisfy the lint
+// but make a fake device read less like the real driver it stands in for.
+#[allow(clippy::unused_async_trait_impl)]
 impl Deallocate for MemDevice {
     async fn deallocate(&self, start_lba: u64, count: u64) -> Result<(), StorageError> {
         let end = start_lba
